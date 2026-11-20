@@ -4,14 +4,14 @@ local materials = require('./materials')
 
 export type Request = {
 	repo: runtime.Repo, checkout: string, kind: string, number: number, pane: number,
-	version: string?, retained: boolean?,
+	version: string?, retained: boolean?, approval: ('preview' | 'inherit')?,
 }
 
-type Done = (string?, string?, string?, string?) -> ()
+type Done = (string?, string?, string?, string?, string?) -> ()
 type Record = { dir: string, program: string, phase: string, file: string?, pane: number?, launchingUntil: number? }
 type Index = { latest: string?, records: { [string]: Record } }
 type Snapshot = { window: string, view: any }
-type Source = { window: string, cwd: string, args: any }
+type Source = { window: string, session: number, cwd: string, args: any }
 
 local SESSION_ROOT = '/task-sessions-v1/'
 local MATERIAL_LIMIT = 384 * 1024
@@ -67,17 +67,17 @@ local function paneAt(view: any, id: number): any
 	return nil
 end
 
-local function visible(view: any, pane: any): boolean
+local function placement(view: any, pane: any): (any, any)
 	for _, session in ipairs(view.sessions) do
 		for _, tab in ipairs(session.tabs) do
 			for _, block in ipairs(tab.blocks) do
 				if block.id == pane.pane and block.live == true and block.program == pane.program and sameArgs(block.args, pane.args) then
-					return true
+					return session, tab
 				end
 			end
 		end
 	end
-	return false
+	return nil, nil
 end
 
 local function scan(exec: runtime.Exec, tool: string, cb: (any, { Snapshot }?, string?) -> ())
@@ -109,13 +109,13 @@ local function scan(exec: runtime.Exec, tool: string, cb: (any, { Snapshot }?, s
 	end)
 end
 
-local function sourceAt(view: any, id: number): any
+local function sourceAt(view: any, id: number): (any, number?)
 	local pane = paneAt(view, id)
-	if pane and pane.exited == nil and pane.program == tern.plugin.id .. '.workbench'
-		and path(pane.cwd) and visible(view, pane) then
-		return pane
+	if pane and pane.exited == nil and pane.program == tern.plugin.id .. '.workbench' and path(pane.cwd) then
+		local session = placement(view, pane)
+		if session and type(session.id) == 'number' then return pane, session.id end
 	end
-	return nil
+	return nil, nil
 end
 
 local function sessionPath(dir: string, file: any): boolean
@@ -200,14 +200,19 @@ local function materialText(material: any): string
 	append('Task and source', { identity = material.identity, head = material.head, url = material.url,
 		title = material.title, fetchedAt = material.fetchedAt }, 6 * 1024)
 	append('Description', material.body, 48 * 1024)
+	append('GitHub mergeability observation (CONFLICTING means merge conflicts; UNKNOWN is not conflict-free)', material.mergeability, 2048)
 	append('Review threads', material.reviewThreads, 144 * 1024)
 	append('Overall review evidence (check each review commit against head)', material.overallReviews, 64 * 1024)
 	append('Current-version CI evidence', material.ci, 112 * 1024)
 	append('Discussion', material.discussion, 64 * 1024)
 	return table.concat(sections)
 end
+local INITIAL_PR = '请用中文逐项处理未解决的审查线程和当前 PR 版本的 CI 证据。区分需要修改、已经处理、需要作者决定以及证据不足的事项，并在任务授权范围内逐项报告。'
+local LEGACY_PR = 'Work through unresolved review threads and current-version CI evidence. Distinguish needed changes, already addressed items, author decisions, and evidence gaps. Report results item by item within the task boundaries.'
 
-local function cliArgs(request: Request, record: Record, checkout: string, version: string, file: string?): { string }
+
+local function cliArgs(request: Request, record: Record, checkout: string, version: string, file: string?,
+	legacy: boolean?, inheritApproval: boolean?): { string }
 	local issue = version == ISSUE
 	local cwd = if issue then checkout else record.dir .. '/worktree'
 	local subject = runtime.repoKey(request.repo) .. ' ' .. request.kind .. ' #' .. tostring(request.number)
@@ -222,17 +227,23 @@ local function cliArgs(request: Request, record: Record, checkout: string, versi
 			.. 'The worktree is not a sandbox. Do not execute scripts, binaries, project tooling, hooks, builds, tests or dependencies from this external PR until the interactive user confirms trust, or in an explicitly authorized isolated environment without host credentials. '
 			.. 'Only version-linked CI evidence supports conclusions about remote checks; local verification is not remote success. '
 	end
-	local argv = {
-		'--cwd=' .. cwd, '--session-dir=' .. record.dir .. '/session', '--config=' .. record.dir .. '/omp.yml',
-		'--no-extensions', '--no-skills', '--no-rules', '--no-context-files', '--no-lsp', '--no-prewalk',
-		'--approval-mode=always-ask', '--append-system-prompt=' .. boundary,
-	}
+	local argv = { '--cwd=' .. cwd, '--session-dir=' .. record.dir .. '/session' }
+	if legacy or not issue then
+		-- A PR worktree is not trusted merely because it was fetched into a private directory.
+		table.insert(argv, '--config=' .. (if legacy then record.dir .. '/omp.yml' else tern.plugin.dir .. '/pr-safety.yml'))
+		for _, arg in ipairs({ '--no-extensions', '--no-skills', '--no-rules', '--no-context-files',
+			'--no-lsp', '--no-prewalk' }) do
+			table.insert(argv, arg)
+		end
+		if not inheritApproval then table.insert(argv, '--approval-mode=always-ask') end
+	end
+	table.insert(argv, '--append-system-prompt=' .. boundary)
 	if file then
 		table.insert(argv, '--resume=' .. file)
 	else
 		table.insert(argv, '@' .. record.dir .. '/materials.md')
-		table.insert(argv, if issue then 'Analyze this issue against the local checkout; distinguish reported behavior, code evidence, and hypotheses. Suggest next steps without editing.'
-			else 'Work through unresolved review threads and current-version CI evidence. Distinguish needed changes, already addressed items, author decisions, and evidence gaps. Report results item by item within the task boundaries.')
+		table.insert(argv, if issue then '请用中文结合本地代码只读分析这条 Issue。区分报告中的现象、代码证据与待验证的假设，并建议下一步。不要修改文件。'
+			else INITIAL_PR)
 	end
 	return argv
 end
@@ -254,16 +265,82 @@ local function invocation(argv: any, request: Request, record: Record, checkout:
 	local last = argv[#argv]
 	local file = if type(last) == 'string' then last:match('^%-%-resume=(.+)$') else nil
 	if file and (not sessionPath(record.dir, file) or (record.file and file ~= record.file)) then return false end
-	local expected = cliArgs(request, record, checkout, version, file)
-	if #argv ~= #expected + 1 then return false end
-	for index, argument in ipairs(expected) do
-		if argv[index + 1] ~= argument then return false end
+	local function matches(expected: { string }): boolean
+		if #argv ~= #expected + 1 then return false end
+		for index, argument in ipairs(expected) do
+			local actual = argv[index + 1]
+			if actual ~= argument then
+				if file or index ~= #expected then return false end
+				if version == ISSUE then
+					-- Older Issue launches used a different first message.
+					return type(last) == 'string' and last ~= '' and not last:match('^[-@]')
+				end
+				return last == LEGACY_PR
+			end
+		end
+		return true
 	end
-	return true
+	-- Accept the former exact launch shape for panes that are still running; never use it for a new launch.
+	return matches(cliArgs(request, record, checkout, version, file))
+		or (version ~= ISSUE and matches(cliArgs(request, record, checkout, version, file, false, true)))
+		or matches(cliArgs(request, record, checkout, version, file, true))
 end
 
 local function paneId(id: number): string
 	return string.format('%.0f', id)
+end
+
+local function taskKey(repo: runtime.Repo, kind: string, number: number, checkout: string): string
+	return 'session-v1:' .. tern.json.encode({ runtime.repoKey(repo), kind, paneId(number), checkout })
+end
+
+-- Prepare a command for the user, never execute it or configure a default push destination.
+function sessions.pushCommand(exec: runtime.Exec, repo: runtime.Repo, checkout: string, number: number,
+	done: (string?, string?, string?) -> ())
+	helper(exec, { 'source', checkout, tern.plugin.data }, nil, function(result, err)
+		local root: string?, data: string? = nil, nil
+		if result and result.status == 0 then root, data = result.stdout:match('^([^\n]+)\n([^\n]+)\n$') end
+		if not root or not data then done(nil, nil, runtime.failure(result, err)); return end
+		local index, problem = getIndex(taskKey(repo, 'pr', number, root))
+		local version = index and index.latest
+		local record = if index and version then index.records[version] else nil
+		if not version or not oid(version) or not record or not recordValid(data .. SESSION_ROOT, record) then
+			done(nil, nil, problem or '此 PR 没有可核对的本机 worktree；请先打开 PR。'); return
+		end
+		materials.pushTarget(exec, repo, number, function(head, url, ref, targetError)
+			if not head or not url or not ref then done(nil, nil, targetError); return end
+			if head ~= version then done(nil, nil, '远端 PR head 已变化，请先打开 PR 核对版本。'); return end
+			helper(exec, { 'push-source', record.dir, head, ref }, nil, function(localHead, checkError)
+				local commit = if localHead and localHead.status == 0 then runtime.trim(localHead.stdout) else nil
+				if not commit or not oid(commit) then
+					local status = localHead and localHead.status
+					done(nil, nil, if status == 2 then 'PR 源分支不是有效的 Git ref。'
+						elseif status == 3 then '没有新提交可推送；未提交改动不会被推送。'
+						elseif status == 4 then '本地提交不能快进远端 PR head；不会生成强推命令。'
+						else '无法核对本机 PR 工作树：' .. runtime.failure(localHead, checkError))
+					return
+				end
+				local function quote(s: string): string return "'" .. (s:gsub("'", "'\\''")) .. "'" end
+				local command = "git -C " .. quote(record.dir .. '/worktree')
+					.. " push --no-follow-tags --recurse-submodules=no -- " .. quote(url) .. " " .. quote(commit .. ':' .. ref)
+				done(command, url .. ' · ' .. ref, nil)
+			end)
+		end)
+	end)
+end
+
+-- Decoration only; activation still verifies the live process and session file.
+function sessions.issueBadges(repo: runtime.Repo, checkout: string): (number) -> string
+	local live: {[number]: boolean} = {}
+	for _, pane in tern.pane.list() do live[pane.pane] = true end
+	return function(number: number): string
+		local index = getIndex(taskKey(repo, ISSUE, number, checkout))
+		local record = if index then index.records[ISSUE] else nil
+		if record and record.phase == 'opened' and record.pane and live[record.pane] then
+			return '处理中 · 本机 omp 面板已打开'
+		end
+		return ''
+	end
 end
 
 local function sameCwd(exec: runtime.Exec, actual: any, expected: string, cb: (boolean) -> ())
@@ -282,6 +359,8 @@ function sessions.open(exec: runtime.Exec, request: Request, progress: (string) 
 		or not (request.number > 0 and request.number < 2^53 and request.number % 1 == 0)
 		or not (request.pane > 0 and request.pane < 2^53 and request.pane % 1 == 0)
 		or (request.version ~= nil and (request.kind ~= 'pr' or not oid(request.version)))
+		or (request.approval ~= nil and (request.kind ~= 'pr' or request.retained
+			or (request.approval == 'inherit' and not request.version)))
 		or (request.retained and not request.version) then
 		done(nil, '任务身份或版本无效。'); return
 	end
@@ -294,10 +373,10 @@ function sessions.open(exec: runtime.Exec, request: Request, progress: (string) 
 			if not windows then done(nil, inspectError); return end
 			local initial: Source? = nil
 			for _, snapshot in ipairs(windows) do
-				local pane = sourceAt(snapshot.view, request.pane)
-				if pane then
+				local pane, session = sourceAt(snapshot.view, request.pane)
+				if pane and session then
 					if initial then done(nil, '来源面板同时出现在多个窗口；请让来源只在一个窗口显示后重试。'); return end
-					initial = { window = snapshot.window, cwd = pane.cwd, args = pane.args }
+					initial = { window = snapshot.window, session = session, cwd = pane.cwd, args = pane.args }
 				end
 			end
 			if not initial then done(nil, '无法确认来源面板仍在其 Tern 窗口运行。'); return end
@@ -309,13 +388,13 @@ function sessions.open(exec: runtime.Exec, request: Request, progress: (string) 
 					done(nil, '无法确认来源 checkout 和私有数据目录：' .. runtime.failure(result, err)); return
 				end
 				local root = data .. SESSION_ROOT
-				local key = 'session-v1:' .. tern.json.encode({ runtime.repoKey(repo), request.kind, paneId(request.number), checkout })
+				local key = taskKey(repo, request.kind, request.number, checkout)
 				if busy[key] then done(nil, '此任务已在另一面板打开中，请等待后再试。'); return end
 				if not alive() then done(nil, '来源面板已关闭。'); return end
 				busy[key] = true
-				local function finish(message: string?, problem: string?, changed: string?, retained: string?)
+				local function finish(message: string?, problem: string?, changed: string?, retained: string?, approvalHead: string?)
 					busy[key] = nil
-					done(message, problem, changed, retained)
+					done(message, problem, changed, retained, approvalHead)
 				end
 				local index, indexError = getIndex(key)
 				if not index then finish(nil, indexError); return end
@@ -333,8 +412,9 @@ function sessions.open(exec: runtime.Exec, request: Request, progress: (string) 
 				end
 				local function guardSource(cb: (any) -> ())
 					inspect(exec, tool, source.window, function(view, problem)
-						local pane = if view then sourceAt(view, request.pane) else nil
-						if not pane or pane.cwd ~= source.cwd or not sameArgs(pane.args, source.args) or not alive() then
+						if not view then finish(nil, problem); return end
+						local pane, session = sourceAt(view, request.pane)
+						if not pane or session ~= source.session or pane.cwd ~= source.cwd or not sameArgs(pane.args, source.args) or not alive() then
 							finish(nil, problem or '来源面板或其窗口已变化；不会改用当前焦点。'); return
 						end
 						cb(view)
@@ -383,11 +463,15 @@ function sessions.open(exec: runtime.Exec, request: Request, progress: (string) 
 								record.phase, record.launchingUntil = 'launching', os.time() + LAUNCH_TIMEOUT + 8
 								index.latest = version
 								if not persist() then return end
-								local argv = { tool, 'split', paneId(request.pane), 'right', '--json', '--window=' .. source.window,
-									'--cwd', record.dir, '--keep-open', '--', record.program }
-								for _, arg in ipairs(cliArgs(request, record, checkout, version, file)) do table.insert(argv, arg) end
+								local argv = { tool, 'new', 'tab', paneId(source.session) }
+								for _, arg in ipairs({ '--json', '--window=' .. source.window, '--cwd', record.dir, '--keep-open', '--', record.program }) do
+									table.insert(argv, arg)
+								end
+								for _, arg in ipairs(cliArgs(request, record, checkout, version, file, false, request.approval == 'inherit')) do
+									table.insert(argv, arg)
+								end
 								progress(if fresh then '正在启动隔离的 omp 会话…' else '正在从确切文件恢复 omp…')
-								exec(argv, { timeout_ms = LAUNCH_TIMEOUT * 1000 }, function(split, splitError)
+								exec(argv, { timeout_ms = LAUNCH_TIMEOUT * 1000 }, function(launchResult, launchError)
 									local function verify(attempts: number)
 										inspect(exec, tool, source.window, function(view, problem)
 											if not view then finish(nil, problem or '无法核验启动结果。'); return end
@@ -406,10 +490,11 @@ function sessions.open(exec: runtime.Exec, request: Request, progress: (string) 
 												if attempts > 0 and alive() then
 													tern.timer(250, function() verify(attempts - 1) end)
 												else
-													finish(nil, '未确认 omp 进程正在运行；请检查已创建的分屏，原工作区及会话记录仍保留。')
+													finish(nil, '未确认 omp 进程正在运行；请检查已创建的标签页，原工作区及会话记录仍保留。')
 												end
 											end
-											if found and visible(view, found) then
+											local session = if found then placement(view, found) else nil
+											if session and session.id == source.session then
 												local pane: number = found.pane
 												running(source.window, pane, function(ok)
 													if not ok then retry(); return end
@@ -419,10 +504,10 @@ function sessions.open(exec: runtime.Exec, request: Request, progress: (string) 
 														else finish(nil, 'omp 已启动，但未能聚焦。') end
 													end)
 												end)
-											elseif fresh and not seen and (not split or (not split.timed_out and (split.status == 1 or split.status == 2))) then
+											elseif fresh and not seen and (not launchResult or (not launchResult.timed_out and (launchResult.status == 1 or launchResult.status == 2))) then
 												record.phase, record.launchingUntil = 'prepared', nil
 												index.latest = previous
-												if persist() then finish(nil, 'Tern 未启动 omp：' .. runtime.failure(split, splitError)) end
+												if persist() then finish(nil, 'Tern 未启动 omp：' .. runtime.failure(launchResult, launchError)) end
 											else
 												retry()
 											end
@@ -493,7 +578,7 @@ function sessions.open(exec: runtime.Exec, request: Request, progress: (string) 
 							local target: string? = nil
 							local otherWindows = 0
 							for _, snapshot in ipairs(snapshots) do
-								if visible(snapshot.view, live) then
+								if placement(snapshot.view, live) then
 									if snapshot.window == source.window then target = source.window; break end
 									otherWindows += 1
 									target = snapshot.window
@@ -508,16 +593,32 @@ function sessions.open(exec: runtime.Exec, request: Request, progress: (string) 
 								guardSource(function(current)
 									local function focus(state: any, err: string?)
 										local pane = if state then paneAt(state, live.pane) else nil
-										if not pane or pane.exited ~= nil or not candidate(pane, record)
-											or not visible(state, pane) or not alive() then
+										if not pane or pane.exited ~= nil or not candidate(pane, record) or not alive() then
 											finish(nil, err or '待聚焦面板已变化，请重试。'); return
 										end
+										local session, tab = placement(state, pane)
+										if not session then finish(nil, '待聚焦面板已变化，请重试。'); return end
 										running(window, pane.pane, function(ok)
 											if not ok or not alive() then finish(nil, '原面板没有运行预期的 omp 进程。'); return end
-											focusOmp(window, pane.pane, function(focused)
-												if focused then opened(pane.pane, '已聚焦原 omp 会话。')
-												else finish(nil, '不能聚焦原 omp 会话。') end
-											end)
+											if request.approval == 'inherit' then
+												note ..= ' 已运行的会话不会更改审批模式；如需按 OMP 配置启动，请先关闭原标签页。'
+											end
+											local function focusExisting()
+												focusOmp(window, pane.pane, function(focused)
+													if focused then opened(pane.pane, '已聚焦原 omp 会话。')
+													else finish(nil, '不能聚焦原 omp 会话。') end
+												end)
+											end
+											for _, block in ipairs(tab.blocks) do
+												if block.live and block.program == tern.plugin.id .. '.workbench' then
+													exec({ tool, 'move', paneId(pane.pane), 'new-tab', '--json', '--window=' .. window }, nil, function(result, moveError)
+														if result and result.status == 0 then focusExisting()
+														else finish(nil, '无法将原任务会话移到新标签页：' .. runtime.failure(result, moveError)) end
+													end)
+													return
+												end
+											end
+											focusExisting()
 										end)
 									end
 									if window == source.window then focus(current, nil) else inspect(exec, tool, window, focus) end
@@ -605,6 +706,7 @@ function sessions.open(exec: runtime.Exec, request: Request, progress: (string) 
 				progress('正在检查远端 PR head…')
 				materials.head(exec, repo, request.number, function(head, problem)
 					if not head or not oid(head) then finish(nil, problem or '无法确认远端 PR head。'); return end
+					if request.approval == 'preview' then finish(nil, nil, nil, nil, head); return end
 					local expected = request.version or latest
 					if expected and expected ~= head then moved(expected, head); return end
 					choose(head)

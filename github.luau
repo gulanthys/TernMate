@@ -7,18 +7,10 @@ export type Filters = { [string]: string }
 export type Row = {
 	number: number, title: string, state: string, updated: string, author: string, url: string,
 	draft: boolean, base: string?, requested: boolean, threads: boolean, ci: string,
+	mergeable: string?,
 }
-export type Page = { rows: { Row }, nextCursor: string?, examined: number, uncertain: number, resetAt: string? }
 
 local github = {}
-local pageInfo = " pageInfo{hasNextPage endCursor} "
-local baseFields = "id number title state updatedAt url author{login}"
-local connections = {
-	labels = "nodes{name}",
-	assignees = "nodes{login}",
-	reviewRequests = "nodes{requestedReviewer{... on User{login}}}",
-	reviewThreads = "nodes{isResolved}",
-}
 
 local function parseRemote(url: string): Repo?
 	local host, path = url:match("^https?://([^/]+)/(.+)$")
@@ -86,46 +78,8 @@ function github.discover(exec: Exec, cwd: string, alive: () -> boolean, done: (s
 	end)
 end
 
-local function graphql(exec: Exec, repo: Repo, query: string, variables: { [string]: any }, allowMissing: boolean,
-	done: (any, string?) -> ())
-	exec({ "gh", "api", "graphql", "--hostname", repo.host, "--method", "POST", "--input", "-", "--include" },
-		{ stdin = tern.json.encode({ query = query, variables = variables }) }, function(raw, err)
-			if not raw then done(nil, runtime.failure(raw, err)); return end
-			local body = raw.stdout:match("\r?\n\r?\n(.+)")
-			local value = if body then runtime.decode(body) else nil
-			if allowMissing and value and value.data and value.data.repository and value.errors and #value.errors == 1 then
-				local failure = value.errors[1]
-				if failure.type == "NOT_FOUND" and failure.path and table.concat(failure.path, ".") == "repository.issueOrPullRequest" then
-					done(value.data, nil); return
-				end
-			end
-			if raw.status ~= 0 then done(nil, runtime.failure(raw, err)); return end
-			if not value or type(value.data) ~= "table" or (value.errors and #value.errors > 0) then
-				done(nil, "GitHub 返回了不完整的查询结果；不能确认筛选结果。")
-				return
-			end
-			done(value.data, nil)
-		end)
-end
-
-local function connection(name: string, size: number, cursor: string?): string
-	return name .. "(first:" .. size .. (if cursor then ",after:" .. cursor else "") .. "){" .. connections[name] .. pageInfo .. "}"
-end
-
-local function fields(kind: string, filters: Filters): string
-	local result = baseFields
-	if filters.label then result ..= " " .. connection("labels", 15) end
-	if kind == "issue" then
-		if filters.assignee then result ..= " " .. connection("assignees", 15) end
-	else
-		result ..= " isDraft baseRefName reviewDecision headRefOid commits(last:1){nodes{commit{oid statusCheckRollup{state contexts(first:1){totalCount}}}}}"
-			.. " " .. connection("reviewRequests", 20) .. " " .. connection("reviewThreads", 20)
-	end
-	return result
-end
-
 local function who(value: string, viewer: string): string
-	return if value:lower() == "@me" then viewer:lower() else value:gsub("^@", ""):lower()
+	return if value:lower() == "@me" then viewer else value:gsub("^@", ""):lower()
 end
 
 local function ciStatus(item: any): string
@@ -141,145 +95,97 @@ local function ciStatus(item: any): string
 	return "unknown"
 end
 
-type Match = { node: any, row: Row, hits: { [string]: boolean } }
-type Pending = { match: Match, name: string, cursor: string }
-
-function github.list(exec: Exec, repo: Repo, kind: string, filters: Filters, cursor: string?, alive: () -> boolean,
-	done: (Page?, string?) -> ())
-	local pr = kind == "pr"
-	local typename = if pr then "PullRequest" else "Issue"
-	local listField = if pr then "pullRequests" else "issues"
-	local selectFields = fields(kind, filters)
-	local variables: { [string]: any } = { owner = repo.owner, name = repo.name }
-	local declarations = "$owner:String!,$name:String!"
-	local selection: string
-	if filters.number then
-		declarations ..= ",$number:Int!"
-		variables.number = tonumber(filters.number)
-		selection = "issueOrPullRequest(number:$number){__typename ... on " .. typename .. "{" .. selectFields .. "}}"
-	else
-		declarations ..= ",$after:String"
-		variables.after = cursor
-		local arguments = "first:20,after:$after,orderBy:{field:UPDATED_AT,direction:DESC}"
-		if filters.state then arguments ..= ",states:[" .. filters.state .. "]" end
-		if pr and filters.base then
-			declarations ..= ",$base:String!"; variables.base = filters.base; arguments ..= ",baseRefName:$base"
-		end
-		selection = listField .. "(" .. arguments .. "){nodes{" .. selectFields .. "}" .. pageInfo .. "}"
+local function includes(connection: any, matches: (any) -> boolean): boolean?
+	if type(connection) ~= "table" or type(connection.nodes) ~= "table" then return nil end
+	for _, entry in connection.nodes do
+		if type(entry) == "table" and matches(entry) then return true end
 	end
-	local repoSelection = if filters.number then "nameWithOwner " .. selection else selection
-	local query = "query(" .. declarations .. "){viewer{login} rateLimit{resetAt} repository(owner:$owner,name:$name){" .. repoSelection .. "}}"
-	graphql(exec, repo, query, variables, filters.number ~= nil, function(data, err)
-		if not alive() then return end
-		if not data then done(nil, err); return end
-		if not data.repository or not data.viewer or type(data.viewer.login) ~= "string" then
-			done(nil, "无法验证仓库和当前 GitHub 账号。检查访问权限后重试。"); return
+	if type(connection.pageInfo) == "table" and connection.pageInfo.hasNextPage == false then return false end
+	return nil
+end
+
+local function unresolved(entry: any): boolean
+	return entry.isResolved == false
+end
+
+function github.project(snapshot: any, kind: string, filters: Filters): ({ Row }, number)
+	local pr = kind == "pr"
+	local viewer = snapshot.viewer:lower()
+	local number = if filters.number then tonumber(filters.number) else nil
+	local author = if filters.author then who(filters.author, viewer) else nil
+	local title = if filters.title then filters.title:lower() else nil
+	local label = if filters.label then filters.label:lower() else nil
+	local assignee = if filters.assignee then who(filters.assignee, viewer) else nil
+	local function labelMatches(entry: any): boolean
+		return type(entry.name) == "string" and entry.name:lower() == label
+	end
+	local function assigneeMatches(entry: any): boolean
+		return type(entry.login) == "string" and entry.login:lower() == assignee
+	end
+	local function reviewerMatches(entry: any): boolean
+		local reviewer = entry.requestedReviewer
+		return type(reviewer) == "table" and type(reviewer.login) == "string" and reviewer.login:lower() == viewer
+	end
+	local rows: { Row } = {}
+	local uncertain = 0
+	for _, item in (if pr then snapshot.prs else snapshot.issues) do
+		if filters.number and item.number ~= number then continue end
+		if filters.state and item.state ~= filters.state then continue end
+		local login = (item.author and item.author.login) or ""
+		if author and login:lower() ~= author then continue end
+		if title and not item.title:lower():find(title, 1, true) then continue end
+		local draft = item.isDraft == true
+		if pr then
+			if filters.base and item.baseRefName ~= filters.base then continue end
+			if filters.draft and draft ~= (filters.draft == "yes") then continue end
+			if filters.review and (item.reviewDecision or "none") ~= filters.review then continue end
 		end
-		local viewer = data.viewer.login
-		local nodes: { any }
-		local nextCursor: string? = nil
-		if filters.number then
-			local node = data.repository.issueOrPullRequest
-			nodes = if node and node.__typename == typename then { node } else {}
-		else
-			local page = data.repository[listField]
-			if not page or not page.nodes or not page.pageInfo then done(nil, "GitHub 未返回完整分页信息。"); return end
-			if page.pageInfo.hasNextPage then
-				nextCursor = page.pageInfo.endCursor
-				if not nextCursor or nextCursor == cursor then done(nil, "GitHub 列表游标缺失或未推进。"); return end
-			end
-			nodes = page.nodes
+		local ci = if pr then ciStatus(item) else "none"
+		local mergeable = if pr and item.state == "OPEN" then
+			(if item.mergeable == "MERGEABLE" or item.mergeable == "CONFLICTING" then item.mergeable else "UNKNOWN") else nil
+		if filters.ci and ci ~= filters.ci and ci ~= "unknown" then continue end
+
+		local unknown = filters.ci ~= nil and ci ~= filters.ci
+		if label then
+			local hasLabel = includes(item.labels, labelMatches)
+			if hasLabel == false then continue end
+			unknown = unknown or hasLabel == nil
 		end
-		local matched: { Match } = {}
-		local pending: { Pending } = {}
-		local incomplete = false
-		local function readConnection(match: Match, name: string, value: any, priorCursor: string?)
-			if not value or not value.nodes or not value.pageInfo then incomplete = true; return end
-			for _, entry in value.nodes do
-				if type(entry) ~= "table" then continue end
-				local hit = if name == "labels" then entry.name and entry.name:lower() == (filters.label or ""):lower()
-					elseif name == "assignees" then entry.login and entry.login:lower() == who(filters.assignee or "", viewer)
-					elseif name == "reviewRequests" then entry.requestedReviewer and entry.requestedReviewer.login
-						and entry.requestedReviewer.login:lower() == viewer:lower()
-					else entry.isResolved == false
-				if hit then match.hits[name] = true; return end
-			end
-			if value.pageInfo.hasNextPage then
-				local after = value.pageInfo.endCursor
-				if type(after) ~= "string" or after == priorCursor or type(match.node.id) ~= "string" then incomplete = true; return end
-				table.insert(pending, { match = match, name = name, cursor = after })
-			end
+		if assignee then
+			if pr then continue end
+			local assigned = includes(item.assignees, assigneeMatches)
+			if assigned == false then continue end
+			unknown = unknown or assigned == nil
 		end
-		for _, item in nodes do
-			if type(item) ~= "table" or type(item.number) ~= "number" or type(item.title) ~= "string" then incomplete = true; continue end
-			local author = (item.author and item.author.login) or ""
-			if filters.state and filters.state ~= item.state then continue end
-			if filters.author and author:lower() ~= who(filters.author, viewer) then continue end
-			if filters.title and not item.title:lower():find(filters.title:lower(), 1, true) then continue end
-			if pr then
-				if filters.base and filters.base ~= item.baseRefName then continue end
-				if filters.draft and (filters.draft == "yes") ~= (item.isDraft == true) then continue end
-				if filters.review and filters.review ~= (item.reviewDecision or "none") then continue end
-			end
-			local row: Row = { number = item.number, title = item.title, state = item.state, updated = item.updatedAt,
-				author = author, url = item.url, draft = item.isDraft == true, base = item.baseRefName,
-				requested = false, threads = false, ci = if pr then ciStatus(item) else "none" }
-			if filters.ci and row.ci ~= filters.ci and row.ci ~= "unknown" then continue end
-			local match: Match = { node = item, row = row, hits = {} }
-			table.insert(matched, match)
-			if filters.label then readConnection(match, "labels", item.labels, nil) end
-			if not pr and filters.assignee then readConnection(match, "assignees", item.assignees, nil) end
-			if pr then
-				readConnection(match, "reviewRequests", item.reviewRequests, nil)
-				readConnection(match, "reviewThreads", item.reviewThreads, nil)
-			end
+		local requested = if pr then includes(item.reviewRequests, reviewerMatches) else false
+		if filters.requested then
+			if requested ~= nil and requested ~= (filters.requested == "yes") then continue end
+			unknown = unknown or requested == nil
 		end
-		local function finish()
-			local rows: { Row } = {}
-			local uncertain = 0
-			for _, match in matched do
-				local row, hits = match.row, match.hits
-				if (filters.label and not hits.labels) or (filters.assignee and not hits.assignees) then continue end
-				row.requested, row.threads = hits.reviewRequests == true, hits.reviewThreads == true
-				if filters.requested and (filters.requested == "yes") ~= row.requested then continue end
-				if filters.threads and (filters.threads == "yes") ~= row.threads then continue end
-				if filters.ci and row.ci ~= filters.ci then uncertain += 1; continue end
-				if filters.actionable and not row.threads and row.ci ~= "failure" then
-					if row.ci == "unknown" then uncertain += 1 end
-					continue
-				end
-				table.insert(rows, row)
-			end
-			done({ rows = rows, nextCursor = nextCursor, examined = #nodes, uncertain = uncertain,
-				resetAt = data.rateLimit and data.rateLimit.resetAt }, nil)
+		local threads = if pr then includes(item.reviewThreads, unresolved) else false
+		if filters.threads then
+			if threads ~= nil and threads ~= (filters.threads == "yes") then continue end
+			unknown = unknown or threads == nil
 		end
-		local function more()
-			if not alive() then return end
-			if incomplete then done(nil, "GitHub 未返回完整的标签、负责人或审查分页信息。"); return end
-			if #pending == 0 then finish(); return end
-			local batch = pending
-			pending = {}
-			local args: { [string]: string } = {}
-			local vars, selectors = {}, {}
-			for index, entry in batch do
-				local id, after = "id" .. index, "after" .. index
-				args[id], args[after] = entry.match.node.id, entry.cursor
-				table.insert(vars, "$" .. id .. ":ID!,$" .. after .. ":String!")
-				table.insert(selectors, "n" .. index .. ":node(id:$" .. id .. "){... on " .. typename .. "{"
-					.. connection(entry.name, 50, "$" .. after) .. "}}")
-			end
-			graphql(exec, repo, "query(" .. table.concat(vars, ",") .. "){" .. table.concat(selectors, " ") .. "}", args, false, function(extra, extraErr)
-				if not alive() then return end
-				if not extra then done(nil, extraErr); return end
-				for index, entry in batch do
-					local node = extra["n" .. index]
-					readConnection(entry.match, entry.name, node and node[entry.name], entry.cursor)
-				end
-				more()
-			end)
+		if filters.actionable and threads ~= true and ci ~= "failure" and mergeable ~= "CONFLICTING" then
+			local cannotHaveThreads = threads == false or (filters.threads ~= nil and filters.threads ~= "yes")
+			if cannotHaveThreads and ci ~= "unknown" and mergeable ~= "UNKNOWN" then continue end
+			unknown = true
 		end
-		more()
+		if unknown then uncertain += 1; continue end
+		local row: Row = {
+			number = item.number, title = item.title, state = item.state, updated = item.updatedAt,
+			author = login, url = item.url, draft = draft, base = item.baseRefName,
+			requested = requested == true, threads = threads == true, ci = ci,
+			mergeable = mergeable,
+		}
+		table.insert(rows, row)
+	end
+	table.sort(rows, function(a, b)
+		if a.updated == b.updated then return a.number > b.number end
+		return a.updated > b.updated
 	end)
+	return rows, uncertain
 end
 
 return github

@@ -29,8 +29,9 @@ local VERSION_FIELDS = [[
 ]]
 
 local ISSUE = "query(" .. TASK_VARS .. ") { repository(owner: $owner, name: $name) { nameWithOwner issue(number: $number) { " .. TASK_FIELDS .. " } } }"
-local PR = "query(" .. TASK_VARS .. ") { repository(owner: $owner, name: $name) { nameWithOwner pullRequest(number: $number) { " .. TASK_FIELDS .. VERSION_FIELDS .. " reviewDecision } } }"
+local PR = "query(" .. TASK_VARS .. ") { repository(owner: $owner, name: $name) { nameWithOwner pullRequest(number: $number) { " .. TASK_FIELDS .. VERSION_FIELDS .. " mergeable reviewDecision } } }"
 local HEAD = "query(" .. TASK_VARS .. ") { repository(owner: $owner, name: $name) { nameWithOwner pullRequest(number: $number) { __typename id number url headRefOid } } }"
+local PUSH_TARGET = "query(" .. TASK_VARS .. ") { repository(owner: $owner, name: $name) { nameWithOwner pullRequest(number: $number) { __typename id number url state headRefOid headRefName headRepository { nameWithOwner } } } }"
 local DISCUSSION = "query($id: ID!, $cursor: String) { node(id: $id) { ... on Issue { id comments(first: 50, after: $cursor) { " .. PAGE .. " nodes { " .. COMMENT_FIELDS .. " } } } } }"
 local THREADS = "query($id: ID!, $cursor: String) { node(id: $id) { ... on PullRequest { id headRefOid reviewThreads(first: 100, after: $cursor) { " .. PAGE .. " nodes { id isResolved } } } } }"
 local OVERALL_REVIEWS = "query($id: ID!, $cursor: String) { node(id: $id) { ... on PullRequest { id headRefOid latestReviews(first: 50, after: $cursor) { " .. PAGE .. " nodes { id url author { login __typename } state submittedAt commit { oid } body } } } } }"
@@ -239,6 +240,24 @@ end
 function materials.head(exec: runtime.Exec, repo: runtime.Repo, number: number, done: (sha: string?, error: string?) -> ())
 	readHead(exec, repo, number, function(revision, err)
 		done(revision, err)
+	end)
+end
+
+function materials.pushTarget(exec: runtime.Exec, repo: runtime.Repo, number: number, done: (string?, string?, string?, string?) -> ())
+	if not validTarget(repo, number) then done(nil, nil, nil, "PR 身份无效。"); return end
+	graphql(exec, repo, PUSH_TARGET, taskFields(repo, number), function(data, err)
+		if err then done(nil, nil, nil, err.message); return end
+		local identity, task = actual(repo, "pr", number, data)
+		if not identity or task.state ~= "OPEN" then done(nil, nil, nil, "只能为可核对的开放 PR 准备推送命令。"); return end
+		local revision = sha(task.headRefOid)
+		local branch = text(task.headRefName)
+		local fullName = if type(task.headRepository) == "table" then text(task.headRepository.nameWithOwner) else nil
+		local owner: string?, name: string? = nil, nil
+		if fullName then owner, name = fullName:match("^([%w][%w_-]*)/([%w_.-]+)$") end
+		if not revision or not branch or branch:find("%c") or not owner or not name or name == "." or name == ".." then
+			done(nil, nil, nil, "无法核对 PR 源仓库、源分支或 head；不会猜测目标。"); return
+		end
+		done(revision, "https://" .. repo.host .. "/" .. owner .. "/" .. name .. ".git", "refs/heads/" .. branch, nil)
 	end)
 end
 
@@ -815,6 +834,11 @@ function materials.collect(exec: runtime.Exec, repo: runtime.Repo, kind: string,
 		local head = sha(task.headRefOid)
 		if not head then finish(nil, "PR 没有可验证的 head SHA。"); return end
 		material.head = head
+		local mergeable = task.mergeable
+		material.mergeability = {
+			status = if mergeable == "CONFLICTING" or mergeable == "MERGEABLE" then mergeable else "UNKNOWN",
+			head = head, base = sha(task.baseRefOid), baseRef = text(task.baseRefName),
+		}
 		local version = versionFor(task, head)
 		overallReviews(activeExec, repo, identity.id, head, task.reviewDecision, function(overall, _reviewError)
 			material.overallReviews = overall

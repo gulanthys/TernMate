@@ -7,6 +7,13 @@ export type Exec = (argv: { string }, opts: Options?, done: (Result?, string?) -
 
 local runtime = {}
 
+local macGhPath: string? = nil
+if tern.runtime.os == "macos" then
+	local path = tern.getenv("PATH")
+	macGhPath = (if path and path ~= "" then path else "/usr/bin:/bin:/usr/sbin:/sbin")
+		.. ":/opt/homebrew/bin:/usr/local/bin"
+end
+
 function runtime.trim(value: string): string
 	return (value:gsub("^%s+", ""):gsub("%s+$", ""))
 end
@@ -20,6 +27,8 @@ function runtime.exec(argv: { string }, opts: Options?, done: (Result?, string?)
 	options.timeout_ms = options.timeout_ms or 30000
 	local env: { [string]: string } = if options.env then table.clone(options.env) else {}
 	if argv[1] == "gh" then
+		-- A GUI-launched daemon can have only the macOS system PATH.
+		if macGhPath and not env.PATH then env.PATH = macGhPath end
 		env.GH_PROMPT_DISABLED = "1"
 		env.GH_PAGER = "cat"
 		env.GH_DEBUG = ""

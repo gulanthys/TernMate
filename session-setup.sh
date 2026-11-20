@@ -73,8 +73,6 @@ case "$1" in
         chmod 700 "$root"
         task=$(mktemp -d "$root/task.XXXXXXXXXX")
         mkdir -m 700 "$task/session"
-        # Extra CLI configuration (higher precedence than project settings).
-        printf '%s\n' 'mcp:' '  enableProjectConfig: false' 'autoResume: false' 'shellPath: /bin/sh' > "$task/omp.yml"
         printf '%s\n' "$task"
         ;;
     material)
@@ -102,7 +100,7 @@ case "$1" in
         # Retain the original PR commit even after local commits change HEAD.
         safe_git --git-dir=store.git update-ref refs/ternmate/initial "$expected"
         ;;
-    check)
+    check|push-source)
         task=$2 expected=$3
         wt=$task/worktree
         admin=$task/store.git/worktrees/worktree
@@ -114,6 +112,13 @@ case "$1" in
         [ "$(safe_git -C "$wt" rev-parse --verify 'refs/ternmate/initial^{commit}')" = "$expected" ] \
             || fail 'PR worktree 的初始提交记录已失效。'
         head=$(safe_git -C "$wt" rev-parse --verify 'HEAD^{commit}')
+        if [ "$1" = push-source ]; then
+            safe_git check-ref-format "$4" >/dev/null || exit 2
+            [ "$head" != "$expected" ] || exit 3
+            safe_git -C "$wt" merge-base --is-ancestor "$expected" "$head" || exit 4
+            printf '%s\n' "$head"
+            exit
+        fi
         printf '%s\n' "$head"
         # Checking status can run a clean filter. Never do so if a user has
         # modified the fresh repository's configuration or added worktree config.

@@ -352,13 +352,14 @@ function batch.new(ctx: any): any
 	end
 	local function scanScope(): string
 		local prefix = if scanBusy then "扫描中（若显示旧事实，不可作完整结算）" elseif not snapshot then "未取得扫描数据"
+			elseif snapshot.complete and not ctx.fresh(snapshot) then "扫描已过期；刷新后才能完整结算"
 			elseif snapshot.complete and index.linksComplete then "Issue／PR 列表及显式关联扫描完整" else "部分扫描"
 		return prefix .. " · 已读 " .. #index.issues .. " 条 Issue、" .. index.prCount .. " 条 PR"
 			.. (if scanError then " · " .. scanError elseif snapshot and not index.linksComplete then " · PR 关闭引用覆盖不全" else "")
 			.. (if snapshot and type(snapshot.observedAt) == "string" then " · 扫描开始 " .. snapshot.observedAt else "")
 	end
 	local function complete(): boolean
-		return not scanBusy and snapshot ~= nil and snapshot.complete == true and index.linksComplete and not scanError
+		return not scanBusy and snapshot ~= nil and snapshot.complete == true and ctx.fresh(snapshot) and index.linksComplete and not scanError
 	end
 	local function readBaseline(onReady: (() -> ())?)
 		revisionRead += 1
@@ -389,10 +390,10 @@ function batch.new(ctx: any): any
 		end
 		read(1, nil)
 	end
-	local function refresh()
+	local function refresh(force: boolean)
 		if scanBusy or baselineBusy or not ctx.alive() then return end
 		scanBusy, scanError = true, nil
-		ctx.fetch(function(current, err)
+		ctx.fetch(force, function(current, err)
 			if not ctx.alive() then return end
 			local old = snapshot
 			scanBusy, snapshot, scanError = false, current, err or (current and current.error)
@@ -406,7 +407,7 @@ function batch.new(ctx: any): any
 		end)
 		draw()
 	end
-	controller.refresh = refresh
+	controller.refresh = function() refresh(true) end
 
 	local function visible(): { any }
 		local group, id = prefGroup(), selectedBatch()
@@ -895,10 +896,12 @@ function batch.new(ctx: any): any
 		if #rows == 0 then table.insert(result, text(if complete() then "该队列没有符合条件的已读事项。" else "尚未在已读范围看到匹配事项。"))
 		else table.insert(result, text((if complete() then "队列事项（按 Issue 去重）：" else "队列已读事项（部分）：") .. #rows
 			.. (if group.queue == "all" and selected then " · 包括未映射事项" else ""))) end
+		local badge = ctx.issueBadges()
 		for i = (page - 1) * PAGE + 1, math.min(page * PAGE, #rows) do
 			local row = rows[i]
 			local number = tostring(row.issue.number)
-			local rowFields: { Node } = { button(rowLabel(row), "open-issue", number, row == active), text(row.reason),
+			local status = badge(row.issue.number)
+			local rowFields: { Node } = { button(rowLabel(row), "open-issue", number, row == active), text((if status == "" then "" else status .. " · ") .. row.reason),
 				button("依据", "evidence", number, evidence == row.issue.id) }
 			if plan and not planPreview and not plan.candidates[row.issue.id] then table.insert(rowFields, button("加入计划预览", "add-plan", number)) end
 			if evidence == row.issue.id and not report then table.insert(rowFields, evidenceView(row)) end
@@ -990,7 +993,7 @@ function batch.new(ctx: any): any
 		if not ctx.alive() then return end
 		notice = nil
 		local row = index.byNumber[tonumber(value) or 0]
-		if action == "refresh" and not baselineBusy then refresh()
+		if action == "refresh" and not baselineBusy then refresh(true)
 		elseif action == "mapping" and not baselineBusy then previewSource = prefs.source or "milestone"
 		elseif action == "preview-mapping" and (value == "title" or value == "milestone") then previewSource = value
 		elseif action == "confirm-mapping" and not baselineBusy and snapshot and (value == "title" or value == "milestone") and value == previewSource then setSource(value)
@@ -1151,8 +1154,13 @@ function batch.new(ctx: any): any
 				if type(stored.byBatch) == "table" then prefs.byBatch = stored.byBatch end
 				if type(stored.knownBatches) == "table" then prefs.knownBatches = stored.knownBatches end
 			end
-			refresh()
+			if snapshot then
+				index = collect(snapshot, prefs.source, fd)
+				readBaseline()
+			end
+			draw()
 		end)
+		refresh(false)
 	end)
 	return controller
 end

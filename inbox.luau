@@ -156,6 +156,7 @@ function inbox.new(ctx: any): any
 	local localError: string? = nil
 	local loading = false
 	local detail: Entry? = nil
+	local detailObservedAt: string? = nil
 	local discussion: any = nil
 	local discussionError: string? = nil
 	local personal: any = nil
@@ -178,7 +179,12 @@ function inbox.new(ctx: any): any
 	end
 
 	local function reclassify()
-		if not snapshot then return end
+		if not snapshot then
+			table.clear(all)
+			table.clear(entries)
+			table.clear(visible)
+			return
+		end
 		all = classify(snapshot, index, runtime.repoKey(ctx.repo) == "github.com/zerx-lab/fluxdown")
 		table.clear(entries)
 		for _, entry in all do entries[tostring(entry.item.number)] = entry end
@@ -194,12 +200,12 @@ function inbox.new(ctx: any): any
 		end)
 	end
 
-	local function refresh()
+	local function refresh(force: boolean)
 		if loading then return end
 		serial += 1
 		local revision = serial
 		loading, errorText = true, nil
-		ctx.fetch(function(value, err)
+		ctx.fetch(force, function(value, err)
 			if not ctx.alive() or revision ~= serial then return end
 			snapshot, errorText, loading = value, err, false
 			reclassify()
@@ -220,6 +226,7 @@ function inbox.new(ctx: any): any
 
 	local function showDetail(entry: Entry)
 		detail, discussion, discussionError, personalSummary = entry, nil, nil, nil
+		detailObservedAt = if snapshot then snapshot.observedAt else nil
 		if entry.kind == "issue" then
 			materials.collect(runtime.exec, ctx.repo, "issue", entry.item.number, function() return ctx.alive() and detail == entry end, function(value, err)
 				if not ctx.alive() or detail ~= entry then return end
@@ -238,7 +245,7 @@ function inbox.new(ctx: any): any
 		local result = { ui.row({button("返回收件箱", "close"), button("在 omp 打开", "open=" .. item.number),
 			button("查看原件", "source", false, not githubUrl(ctx, item.url))}),
 			text("#" .. item.number .. " " .. item.title, "strong"), text(stateName(item) .. " · GitHub 更新时间 " .. tostring(item.updatedAt)),
-			text("扫描于 " .. (if snapshot then snapshot.observedAt else "未知")) }
+			text("扫描于 " .. (detailObservedAt or "未知")) }
 		for _, reason in entry.reasons do table.insert(result, text(reason)) end
 		if entry.kind == "pr" then
 			table.insert(result, text("head " .. tostring(item.headRefOid) .. " · 整体审查 " .. tostring(item.reviewDecision or "无结论")))
@@ -283,7 +290,13 @@ function inbox.new(ctx: any): any
 			for _, node in personal.view() do table.insert(result, node) end
 			return result
 		end
-		if detail then return detailView(detail) end
+		if detail then
+			local nodes = detailView(detail)
+			if loading or entries[tostring(detail.item.number)] ~= detail or not snapshot or not ctx.fresh(snapshot) then
+				table.insert(nodes, 1, text("列表证据未齐、已更新或已过期；以 GitHub 原件为准。", "warning"))
+			end
+			return nodes
+		end
 		local children: {Node} = {text("社区收件箱 · 已观察事实与下一动作", "strong")}
 		local width = if ctx.cx.cols >= 95 then 4 else 2
 		for first = 1, #queues, width do
@@ -300,14 +313,18 @@ function inbox.new(ctx: any): any
 		if errorText then table.insert(children, text("覆盖不完整：" .. errorText, "warning")) end
 		if localError then table.insert(children, text("私有验收记录不可读：" .. localError, "warning")) end
 		if snapshot then
-			local incomplete = not snapshot.complete
+			local stale = snapshot.complete and not loading and not ctx.fresh(snapshot)
+			local incomplete = not snapshot.complete or stale
+			if stale then table.insert(children, text("扫描已过期，请刷新证据。", "warning")) end
 			local first = (math.ceil(position / PAGE) - 1) * PAGE + 1
 			local rows: {Node} = {}
+			local badge = ctx.issueBadges()
 			for i = first, math.min(#visible, first + PAGE - 1) do
 				local entry = visible[i]
 				local label = (if entry.kind == "issue" then "Issue #" else "PR #") .. entry.item.number .. " · " .. entry.item.title
+				local status = if entry.kind == "issue" then badge(entry.item.number) else ""
 				local item = ui.node("item", {key = "n" .. entry.item.number, label = label,
-					detail = stateName(entry.item) .. " · " .. table.concat(entry.reasons, " · "),
+					detail = (if status == "" then "" else status .. " · ") .. stateName(entry.item) .. " · " .. table.concat(entry.reasons, " · "),
 					actions = {click = "inbox:open=" .. entry.item.number,
 						menu = {{id = "inbox:detail=" .. entry.item.number, label = "查看依据"}}}})
 				table.insert(rows, item)
@@ -344,7 +361,7 @@ function inbox.new(ctx: any): any
 		if action == "open" and entry then open(entry)
 		elseif action == "detail" and entry then showDetail(entry)
 		elseif action == "close" then detail = nil
-		elseif action == "refresh" then refresh()
+		elseif action == "refresh" then refresh(true)
 		elseif action == "personal" and detail and detail.kind == "issue" then personal = verification.new(ctx, detail.item)
 		elseif action == "filter" then editor = {text = needle}
 		elseif action == "queue" and value then
@@ -401,8 +418,8 @@ function inbox.new(ctx: any): any
 		return true
 	end
 
-	refresh()
-	return {view = view, event = event, key = key, refresh = refresh}
+	refresh(false)
+	return {view = view, event = event, key = key, refresh = function() refresh(true) end}
 end
 
 return inbox
