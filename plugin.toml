@@ -10,3 +10,4 @@ window = "window.luau"
 [[blocks]]
 id = "workbench"
 title = "TernMate"
+palette = false

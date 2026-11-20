@@ -29,10 +29,11 @@ local VERSION_FIELDS = [[
 ]]
 
 local ISSUE = "query(" .. TASK_VARS .. ") { repository(owner: $owner, name: $name) { nameWithOwner issue(number: $number) { " .. TASK_FIELDS .. " } } }"
-local PR = "query(" .. TASK_VARS .. ") { repository(owner: $owner, name: $name) { nameWithOwner pullRequest(number: $number) { " .. TASK_FIELDS .. VERSION_FIELDS .. " } } }"
+local PR = "query(" .. TASK_VARS .. ") { repository(owner: $owner, name: $name) { nameWithOwner pullRequest(number: $number) { " .. TASK_FIELDS .. VERSION_FIELDS .. " reviewDecision } } }"
 local HEAD = "query(" .. TASK_VARS .. ") { repository(owner: $owner, name: $name) { nameWithOwner pullRequest(number: $number) { __typename id number url headRefOid } } }"
 local DISCUSSION = "query($id: ID!, $cursor: String) { node(id: $id) { ... on Issue { id comments(first: 50, after: $cursor) { " .. PAGE .. " nodes { " .. COMMENT_FIELDS .. " } } } } }"
 local THREADS = "query($id: ID!, $cursor: String) { node(id: $id) { ... on PullRequest { id headRefOid reviewThreads(first: 100, after: $cursor) { " .. PAGE .. " nodes { id isResolved } } } } }"
+local OVERALL_REVIEWS = "query($id: ID!, $cursor: String) { node(id: $id) { ... on PullRequest { id headRefOid latestReviews(first: 50, after: $cursor) { " .. PAGE .. " nodes { id url author { login __typename } state submittedAt commit { oid } body } } } } }"
 local REPLIES = "query($id: ID!, $cursor: String) { node(id: $id) { ... on PullRequestReviewThread { " .. THREAD_FIELDS .. [[
 	pullRequest { id headRefOid }
 	comments(first: 50, after: $cursor) { ]] .. PAGE .. " nodes { " .. COMMENT_FIELDS .. [[
@@ -362,6 +363,30 @@ local function reviewThreads(exec: runtime.Exec, repo: runtime.Repo, prId: strin
 		return nil
 	end, function(err)
 		if err then done(nil, err) else load(1) end
+	end)
+end
+
+local function overallReviews(exec: runtime.Exec, repo: runtime.Repo, prId: string, head: string, decision: any, done: Callback)
+	local evidence: any = {decision = text(decision), head = head, reviews = tern.json.array()}
+	walk(function(cursor, receive)
+		graphql(exec, repo, OVERALL_REVIEWS, withCursor({ "-f", "id=" .. prId }, cursor), function(data, err)
+			if err then receive(nil, err); return end
+			local node = data and data.node
+			if type(node) ~= "table" or node.id ~= prId or sha(node.headRefOid) ~= head then
+				receive(nil, problem("unverified", "未能把整体审查对应到任务 head。")); return
+			end
+			receive(node.latestReviews, nil)
+		end)
+	end, function(review)
+		if review.state == "CHANGES_REQUESTED" or review.state == "APPROVED" then
+			review.onCurrentHead = type(review.commit) == "table" and sha(review.commit.oid) == head
+			table.insert(evidence.reviews, review)
+		end
+		return nil
+	end, function(err)
+		evidence.complete = err == nil
+		if err then evidence.error = err.message end
+		done(evidence, nil)
 	end)
 end
 
@@ -791,19 +816,22 @@ function materials.collect(exec: runtime.Exec, repo: runtime.Repo, kind: string,
 		if not head then finish(nil, "PR 没有可验证的 head SHA。"); return end
 		material.head = head
 		local version = versionFor(task, head)
-		reviewThreads(activeExec, repo, identity.id, head, function(threads, reviewError)
-			if reviewError then finish(nil, "读取 PR 审查线程：" .. reviewError.message); return end
-			material.reviewThreads = threads
-			exactChecks(activeExec, repo, number, head, function(ci, checks)
-				material.ci = ci
-				enrichFailures(activeExec, repo, version, checks, ci, function()
-					readHead(activeExec, repo, number, function(current, headError, id)
-						if headError then finish(nil, "复核 PR 版本：" .. headError); return end
-						if current ~= head or id ~= identity.id then
-							finish(nil, "读取期间 PR head 已变化（" .. head .. " → " .. (current or "未知") .. "）；请刷新后重试。")
-							return
-						end
-						finish(material, nil)
+		overallReviews(activeExec, repo, identity.id, head, task.reviewDecision, function(overall, _reviewError)
+			material.overallReviews = overall
+			reviewThreads(activeExec, repo, identity.id, head, function(threads, reviewError)
+				if reviewError then finish(nil, reviewError.message); return end
+				material.reviewThreads = threads
+				exactChecks(activeExec, repo, number, head, function(ci, checks)
+					material.ci = ci
+					enrichFailures(activeExec, repo, version, checks, ci, function()
+						readHead(activeExec, repo, number, function(current, headError, id)
+							if headError then finish(nil, "复核 PR 版本：" .. headError); return end
+							if current ~= head or id ~= identity.id then
+								finish(nil, "读取期间 PR head 已变化（" .. head .. " → " .. (current or "未知") .. "）；请刷新后重试。")
+								return
+							end
+							finish(material, nil)
+						end)
 					end)
 				end)
 			end)

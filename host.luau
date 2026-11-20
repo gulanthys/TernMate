@@ -3,14 +3,18 @@
 local runtime = require("./runtime")
 local github = require("./github")
 local sessions = require("./sessions")
+local maintenance = require("./maintenance_data")
+local inbox = require("./inbox")
+local batch = require("./batch")
+local issueSubmit = require("./issue_submit")
 local ui = tern.ui
 
 type Repo = runtime.Repo
 type Filters = github.Filters
 type Row = github.Row
 type Prefs = { filters: Filters, selected: number?, position: number? }
-type Saved = { checkout: string?, repo: string?, kind: string, filtersByRepo: { [string]: { [string]: Prefs } } }
-type Confirm = { number: number, head: string, retained: string? }
+type Saved = { checkout: string?, repo: string?, kind: string, filtersByRepo: { [string]: { [string]: Prefs } }, maintenanceByRepo: { [string]: any }? }
+type Confirm = { kind: string, number: number, head: string, retained: string? }
 type Editor = { key: string, text: string, caret: number, error: string? }
 type Listing = {
 	rows: { Row }, seen: { [number]: boolean }, cursor: string?, exhausted: boolean, loading: boolean,
@@ -22,6 +26,7 @@ type State = {
 	scopeError: string?, listing: Listing?, filtersOpen: boolean, field: string?, edit: Editor?,
 	lastRefresh: number?,
 	opening: number?, progress: string?, taskError: string?, confirm: Confirm?,
+	panel: any?, mode: string?,
 }
 type Choice = { string }
 type Field = { key: string, title: string, choices: { Choice }? }
@@ -163,6 +168,7 @@ local function reload(state: State, cx: BlockCx, preserve: boolean)
 end
 
 local function chooseRepo(state: State, cx: BlockCx, repo: Repo)
+	state.panel, state.mode = nil, nil
 	state.repo, state.saved.repo = repo, runtime.repoKey(repo)
 	state.scopeError, state.taskError, state.confirm, state.progress = nil, nil, nil, nil
 	state.filtersOpen, state.field, state.edit = false, nil, nil
@@ -170,6 +176,7 @@ local function chooseRepo(state: State, cx: BlockCx, repo: Repo)
 end
 
 local function discover(state: State, cx: BlockCx, cwd: string)
+	state.panel, state.mode = nil, nil
 	state.generation += 1
 	state.source, state.repo, state.repos, state.listing = cwd, nil, {}, nil
 	state.discovery, state.scopeError, state.taskError, state.confirm, state.progress = true, nil, nil, nil, nil
@@ -206,17 +213,11 @@ local function choosePosition(state: State, index: number)
 	setPosition(pref(state, repo), list, index)
 end
 
-local function openRow(state: State, cx: BlockCx, number: number, version: string?, retained: boolean?)
-	local repo, checkout, list = state.repo, state.saved.checkout, state.listing
-	if not repo or not checkout or not list or state.opening then return end
-	if version then
-		if not state.confirm or state.confirm.number ~= number then return end
-	else
-		if not list.seen[number] then return end
-		for index, row in list.rows do if row.number == number then choosePosition(state, index); break end end
-	end
+local function openTask(state: State, cx: BlockCx, kind: string, number: number, version: string?, retained: boolean?)
+	local repo, checkout = state.repo, state.saved.checkout
+	if not repo or not checkout or state.opening or (kind ~= ISSUE and kind ~= PR) then return end
 	state.opening, state.confirm, state.taskError, state.progress = number, nil, nil, "准备任务 #" .. number .. "…"
-	sessions.open(runtime.exec, { repo = repo, checkout = checkout, kind = state.saved.kind, number = number, pane = cx.pane,
+	sessions.open(runtime.exec, { repo = repo, checkout = checkout, kind = kind, number = number, pane = cx.pane,
 		version = version, retained = retained },
 		function(message)
 			if not runtime.alive(cx.pane) then return end
@@ -226,10 +227,86 @@ local function openRow(state: State, cx: BlockCx, number: number, version: strin
 			state.opening = nil
 			if not runtime.alive(cx.pane) then return end
 			state.progress, state.taskError = message, err
-			state.confirm = if changedHead then { number = number, head = changedHead, retained = retainedHead } else nil
-			if message and not err then reload(state, cx, true) end
+			state.confirm = if changedHead then { kind = kind, number = number, head = changedHead, retained = retainedHead } else nil
+			if message and not err and not state.panel then reload(state, cx, true) end
 			cx:render()
 		end)
+end
+
+local function openRow(state: State, cx: BlockCx, number: number)
+	local list = state.listing
+	if not list or not list.seen[number] then return end
+	for index, row in list.rows do if row.number == number then choosePosition(state, index); break end end
+	openTask(state, cx, state.saved.kind, number)
+end
+
+local function setMode(state: State, cx: BlockCx, mode: string?)
+	local repo, checkout = state.repo, state.saved.checkout
+	if not repo or not checkout or state.opening then return end
+	state.mode, state.panel, state.confirm, state.progress, state.taskError = mode, nil, nil, nil, nil
+	if not mode then reload(state, cx, true); return end
+	if state.edit then
+		state.edit = nil
+		local clear: {any} = { "focus", tern.json.null }
+		cx:frame({ clear })
+	end
+	if not state.saved.maintenanceByRepo then state.saved.maintenanceByRepo = {} end
+	local saved = state.saved.maintenanceByRepo :: { [string]: any }
+	local repoKey = runtime.repoKey(repo)
+	if not saved[repoKey] then saved[repoKey] = {} end
+	local marker = {}
+	local pinned: any = nil
+	local function alive(): boolean
+		return state.panel ~= nil and state.panel.marker == marker and runtime.alive(cx.pane)
+	end
+	local function identity(done: (any, string?) -> ())
+		maintenance.identity(repo, function(info, err)
+			if not info then done(nil, err); return end
+			if pinned and (pinned.repoId ~= info.repoId or pinned.viewer ~= info.viewer) then
+				done(nil, "仓库身份或登录账号已变化；请退出并重新进入。"); return
+			end
+			pinned = pinned or info
+			done(info, nil)
+		end)
+	end
+	local ctx: any = {
+		repo = repo, checkout = checkout, cx = cx, alive = alive, prefs = saved[repoKey],
+		render = function() if alive() then cx:render() end end,
+		open = function(kind: string, number: number) if alive() then openTask(state, cx, kind, number) end end,
+		identity = identity,
+		receiptExcluded = function(issue: any): string?
+			local issuePrefs = state.saved.filtersByRepo[repoKey]
+			local filters: Filters = if issuePrefs and issuePrefs[ISSUE] then issuePrefs[ISSUE].filters else { state = "OPEN" }
+			if state.saved.kind == PR then return "当前列表显示 PR。" end
+			if filters.number and tonumber(filters.number) ~= issue.number then return "当前编号筛选不包含新 Issue。" end
+			if filters.state and type(issue.state) == "string" and filters.state ~= issue.state:upper() then return "当前状态筛选不包含新 Issue。" end
+			if filters.title and type(issue.title) == "string" and not issue.title:lower():find(filters.title:lower(), 1, true) then
+				return "当前标题筛选不包含新 Issue。"
+			end
+			return nil
+		end,
+	}
+	ctx.fetch = function(done: (any, string?) -> (), progress: ((any) -> ())?)
+		identity(function(info, err)
+			if not alive() then return end
+			if not info then done(nil, err); return end
+			maintenance.fetch(repo, info, alive, function(snapshot, scanError)
+				if alive() then ctx.snapshot = snapshot; done(snapshot, scanError) end
+			end, progress)
+		end)
+	end
+	ctx.store = function(key: string, storeMode: string, value: any, done: (any, string?) -> ())
+		if pinned then maintenance.store(repo, pinned, key, storeMode, value, done)
+		else
+			identity(function(info, err)
+				if info then maintenance.store(repo, info, key, storeMode, value, done) else done(nil, err) end
+			end)
+		end
+	end
+	-- Install the marker before constructing the controller; new() may start I/O.
+	local panel: any = { marker = marker }
+	state.panel = panel
+	panel.controller = if mode == "batch" then batch.new(ctx) elseif mode == "submit" then issueSubmit.new(ctx) else inbox.new(ctx)
 end
 
 local function fieldFor(state: State, key: string): Field?
@@ -365,10 +442,22 @@ local function editorView(edit: Editor, title: string): Node
 	return ui.card("", items, { key = "editor" })
 end
 
+local function taskDock(state: State, busy: boolean): { Node }
+	local dock: { Node } = {}
+	if state.progress then table.insert(dock, text(state.progress, if busy then "accent" else "muted")) end
+	if state.taskError then table.insert(dock, text(state.taskError, "warning")) end
+	if state.confirm then
+		local choices = {}
+		if state.confirm.retained then table.insert(choices, button("保留并打开旧版本 " .. state.confirm.retained:sub(1, 8), "previous")) end
+		table.insert(choices, button("打开新版本 " .. state.confirm.head:sub(1, 8), "new_version"))
+		table.insert(dock, ui.row(choices))
+	end
+	return dock
+end
+
 local function view(state: State, cx: BlockCx): BlockView
 	local repo, list, edit = state.repo, state.listing, state.edit
 	local main: { Node } = {}
-	local dock: { Node } = {}
 	local busy = state.opening ~= nil
 	local heading = if repo then repo.owner .. "/" .. repo.name else "选择 GitHub 仓库"
 	table.insert(main, ui.text({ ui.span(heading, "strong"), ui.span(if repo then "  " .. repo.host else "", "muted") }))
@@ -376,7 +465,12 @@ local function view(state: State, cx: BlockCx): BlockView
 	table.insert(main, ui.row({ button("本地 checkout…", "checkout", false, busy),
 		button(if repo then "刷新" else "重新探测", "refresh", false, busy or state.discovery) }))
 	if state.discovery then table.insert(main, ui.progress(nil, "正在识别 Git remote 和 fork 上游…")) end
-	if state.scopeError then table.insert(main, text(state.scopeError, "error")) end
+	if state.scopeError then
+		table.insert(main, text(state.scopeError, "error"))
+		if not state.saved.checkout then
+			table.insert(main, text("请选择「本地 checkout…」，或从工作目录在目标仓库内的 Tern 面板打开。omp --cwd 不会设置 Tern 面板的目录。"))
+		end
+	end
 	if #state.repos > 1 or (not repo and #state.repos > 0 and not state.scopeError) then
 		local choices = {}
 		for index, candidate in state.repos do
@@ -384,6 +478,19 @@ local function view(state: State, cx: BlockCx): BlockView
 			table.insert(choices, button(label, "repo=" .. index, repo == candidate, busy))
 		end
 		lines(main, choices, if cx.cols >= 82 then 2 else 1)
+	end
+	local panel = state.panel
+	if repo then
+		lines(main, {
+			button("任务浏览", "mode=browse", not state.mode, busy),
+			button("社区收件箱", "mode=inbox", state.mode == "inbox", busy),
+			button("批次回顾", "mode=batch", state.mode == "batch", busy),
+			button("新建 Issue", "mode=submit", state.mode == "submit", busy),
+		}, if cx.cols >= 75 then 4 else 2)
+	end
+	if panel then
+		for _, node in panel.controller.view() do table.insert(main, node) end
+		return { main = ui.col(main), dock = ui.col(taskDock(state, busy)) }
 	end
 	if edit and edit.key == "checkout" then table.insert(main, editorView(edit, "选择本地 checkout")) end
 	if not repo or not list then return { main = ui.col(main) } end
@@ -449,14 +556,8 @@ local function view(state: State, cx: BlockCx): BlockView
 		table.insert(main, ui.row({ button("上一页", "prev", false, page <= 1), button("下一页", "next", false, list.loading or (list.exhausted and last == #list.rows)),
 			text(first .. "–" .. last .. " / " .. #list.rows .. (if list.exhausted then "" else " 已找到 · 尚未扫完")) }))
 	end
-	if state.progress then table.insert(dock, text(state.progress, if busy then "accent" else "muted")) end
-	if state.taskError then table.insert(dock, text(state.taskError, "warning")) end
-	if state.confirm then
-		local choices = {}
-		if state.confirm.retained then table.insert(choices, button("保留并打开旧版本 " .. state.confirm.retained:sub(1, 8), "previous")) end
-		table.insert(choices, button("打开新版本 " .. state.confirm.head:sub(1, 8), "new_version"))
-		table.insert(dock, ui.row(choices))
-	elseif not busy then
+	local dock = taskDock(state, busy)
+	if not state.confirm and not busy then
 		table.insert(dock, text("↑↓ 选择 · Enter / 单击打开 · Tab 切换 · / 标题 · R 刷新"))
 	end
 	return { main = ui.col(main), dock = ui.col(dock) }
@@ -477,6 +578,15 @@ local block: BlockDef<State> = {
 	title = function(state) local repo = state.repo; return if repo then "TernMate · " .. repo.owner .. "/" .. repo.name else "TernMate" end,
 	view = view,
 	key = function(state, key, cx)
+		if state.opening then return false end
+		local panel = state.panel
+		if panel then
+			local controller = panel.controller
+			if controller.key and controller.key(key) then return true end
+			if key.name == "escape" then setMode(state, cx, nil); return true end
+			if key.name == "r" and not key.ctrl and not key.meta and not key.alt and controller.refresh then controller.refresh(); return true end
+			return false
+		end
 		local edit = state.edit
 		if edit then
 			if key.name == "enter" then submitEditor(state, cx); return true end
@@ -505,7 +615,41 @@ local block: BlockDef<State> = {
 		end
 		if ev.ev ~= "action" then return end
 		local action, value = ev.act, ev.value
-		if state.opening then return end
+		if state.opening or type(action) ~= "string" then return end
+		local panel = state.panel
+		if action == "mode" then
+			if value == "browse" then
+				if panel then setMode(state, cx, nil) end
+			elseif (value == "inbox" or value == "batch" or value == "submit") and value ~= state.mode then
+				setMode(state, cx, value)
+			end
+			return
+		end
+		if action == "new_version" or action == "previous" then
+			local change = state.confirm
+			if not change then return end
+			if action == "new_version" then openTask(state, cx, change.kind, change.number, change.head)
+			elseif change.retained then openTask(state, cx, change.kind, change.number, change.retained, true) end
+			return
+		end
+		if panel then
+			local controller = panel.controller
+			local prefix, command = action:match("^(%a+):(.+)$")
+			if command and (prefix == state.mode or (state.mode == "inbox" and prefix == "verify")) then
+				controller.event(if prefix == "verify" then "verify:" .. command else command, value)
+			elseif action == "checkout" then
+				setMode(state, cx, nil)
+				setEditor(state, cx, "checkout", state.saved.checkout or state.source)
+			elseif action == "repo" then
+				local candidate = state.repos[tonumber(value) or 0]
+				if candidate and candidate ~= state.repo then chooseRepo(state, cx, candidate) end
+			elseif action == "refresh" and controller.refresh then controller.refresh()
+			elseif action == "return_to_list" and state.progress and controller.refresh then
+				state.progress = nil
+				controller.refresh()
+			end
+			return
+		end
 		local repo, list = state.repo, state.listing
 		if action == "return_to_list" then
 			local lastRefresh = state.lastRefresh or 0
@@ -531,11 +675,6 @@ local block: BlockDef<State> = {
 			if type(value) ~= "string" then return end
 			local generation, number = value:match("^(%d+):(%d+)$")
 			if tonumber(generation) == state.generation and number then openRow(state, cx, assert(tonumber(number))) end
-		elseif action == "new_version" or action == "previous" then
-			local change = state.confirm
-			if not change then return end
-			if action == "new_version" then openRow(state, cx, change.number, change.head)
-			elseif change.retained then openRow(state, cx, change.number, change.retained, true) end
 		elseif action == "prev" or action == "next" then
 			local nextPage = pageAt(list) + (if action == "prev" then -1 else 1)
 			local first = (nextPage - 1) * PAGE + 1

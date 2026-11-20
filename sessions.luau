@@ -201,6 +201,7 @@ local function materialText(material: any): string
 		title = material.title, fetchedAt = material.fetchedAt }, 6 * 1024)
 	append('Description', material.body, 48 * 1024)
 	append('Review threads', material.reviewThreads, 144 * 1024)
+	append('Overall review evidence (check each review commit against head)', material.overallReviews, 64 * 1024)
 	append('Current-version CI evidence', material.ci, 112 * 1024)
 	append('Discussion', material.discussion, 64 * 1024)
 	return table.concat(sections)
