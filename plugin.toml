@@ -1,0 +1,12 @@
+schema = 1
+id = "ternmate"
+name = "TernMate"
+version = "0.1.0"
+description = "GitHub Issue and PR workbench for omp"
+icon = "git-branch"
+host = "host.luau"
+window = "window.luau"
+
+[[blocks]]
+id = "workbench"
+title = "TernMate"
