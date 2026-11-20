@@ -4,10 +4,10 @@ local materials = require('./materials')
 
 export type Request = {
 	repo: runtime.Repo, checkout: string, kind: string, number: number, pane: number,
-	version: string?, retained: boolean?, approval: ('preview' | 'inherit')?,
+	version: string?, retained: boolean?,
 }
 
-type Done = (string?, string?, string?, string?, string?) -> ()
+type Done = (string?, string?, string?, string?) -> ()
 type Record = { dir: string, program: string, phase: string, file: string?, pane: number?, launchingUntil: number? }
 type Index = { latest: string?, records: { [string]: Record } }
 type Snapshot = { window: string, view: any }
@@ -212,7 +212,7 @@ local LEGACY_PR = 'Work through unresolved review threads and current-version CI
 
 
 local function cliArgs(request: Request, record: Record, checkout: string, version: string, file: string?,
-	legacy: boolean?, inheritApproval: boolean?): { string }
+	previous: ('forced-approval' | 'task-overlay')?): { string }
 	local issue = version == ISSUE
 	local cwd = if issue then checkout else record.dir .. '/worktree'
 	local subject = runtime.repoKey(request.repo) .. ' ' .. request.kind .. ' #' .. tostring(request.number)
@@ -228,14 +228,14 @@ local function cliArgs(request: Request, record: Record, checkout: string, versi
 			.. 'Only version-linked CI evidence supports conclusions about remote checks; local verification is not remote success. '
 	end
 	local argv = { '--cwd=' .. cwd, '--session-dir=' .. record.dir .. '/session' }
-	if legacy or not issue then
+	if previous == 'task-overlay' or not issue then
 		-- A PR worktree is not trusted merely because it was fetched into a private directory.
-		table.insert(argv, '--config=' .. (if legacy then record.dir .. '/omp.yml' else tern.plugin.dir .. '/pr-safety.yml'))
+		table.insert(argv, '--config=' .. (if previous == 'task-overlay' then record.dir .. '/omp.yml' else tern.plugin.dir .. '/pr-safety.yml'))
 		for _, arg in ipairs({ '--no-extensions', '--no-skills', '--no-rules', '--no-context-files',
 			'--no-lsp', '--no-prewalk' }) do
 			table.insert(argv, arg)
 		end
-		if not inheritApproval then table.insert(argv, '--approval-mode=always-ask') end
+		if previous then table.insert(argv, '--approval-mode=always-ask') end
 	end
 	table.insert(argv, '--append-system-prompt=' .. boundary)
 	if file then
@@ -280,10 +280,10 @@ local function invocation(argv: any, request: Request, record: Record, checkout:
 		end
 		return true
 	end
-	-- Accept the former exact launch shape for panes that are still running; never use it for a new launch.
+	-- Recognize older running panes without reusing their overrides on launch.
 	return matches(cliArgs(request, record, checkout, version, file))
-		or (version ~= ISSUE and matches(cliArgs(request, record, checkout, version, file, false, true)))
-		or matches(cliArgs(request, record, checkout, version, file, true))
+		or (version ~= ISSUE and matches(cliArgs(request, record, checkout, version, file, 'forced-approval')))
+		or matches(cliArgs(request, record, checkout, version, file, 'task-overlay'))
 end
 
 local function paneId(id: number): string
@@ -359,8 +359,6 @@ function sessions.open(exec: runtime.Exec, request: Request, progress: (string) 
 		or not (request.number > 0 and request.number < 2^53 and request.number % 1 == 0)
 		or not (request.pane > 0 and request.pane < 2^53 and request.pane % 1 == 0)
 		or (request.version ~= nil and (request.kind ~= 'pr' or not oid(request.version)))
-		or (request.approval ~= nil and (request.kind ~= 'pr' or request.retained
-			or (request.approval == 'inherit' and not request.version)))
 		or (request.retained and not request.version) then
 		done(nil, '任务身份或版本无效。'); return
 	end
@@ -392,9 +390,9 @@ function sessions.open(exec: runtime.Exec, request: Request, progress: (string) 
 				if busy[key] then done(nil, '此任务已在另一面板打开中，请等待后再试。'); return end
 				if not alive() then done(nil, '来源面板已关闭。'); return end
 				busy[key] = true
-				local function finish(message: string?, problem: string?, changed: string?, retained: string?, approvalHead: string?)
+				local function finish(message: string?, problem: string?, changed: string?, retained: string?)
 					busy[key] = nil
-					done(message, problem, changed, retained, approvalHead)
+					done(message, problem, changed, retained)
 				end
 				local index, indexError = getIndex(key)
 				if not index then finish(nil, indexError); return end
@@ -467,7 +465,7 @@ function sessions.open(exec: runtime.Exec, request: Request, progress: (string) 
 								for _, arg in ipairs({ '--json', '--window=' .. source.window, '--cwd', record.dir, '--keep-open', '--', record.program }) do
 									table.insert(argv, arg)
 								end
-								for _, arg in ipairs(cliArgs(request, record, checkout, version, file, false, request.approval == 'inherit')) do
+								for _, arg in ipairs(cliArgs(request, record, checkout, version, file)) do
 									table.insert(argv, arg)
 								end
 								progress(if fresh then '正在启动隔离的 omp 会话…' else '正在从确切文件恢复 omp…')
@@ -600,9 +598,6 @@ function sessions.open(exec: runtime.Exec, request: Request, progress: (string) 
 										if not session then finish(nil, '待聚焦面板已变化，请重试。'); return end
 										running(window, pane.pane, function(ok)
 											if not ok or not alive() then finish(nil, '原面板没有运行预期的 omp 进程。'); return end
-											if request.approval == 'inherit' then
-												note ..= ' 已运行的会话不会更改审批模式；如需按 OMP 配置启动，请先关闭原标签页。'
-											end
 											local function focusExisting()
 												focusOmp(window, pane.pane, function(focused)
 													if focused then opened(pane.pane, '已聚焦原 omp 会话。')
@@ -706,7 +701,6 @@ function sessions.open(exec: runtime.Exec, request: Request, progress: (string) 
 				progress('正在检查远端 PR head…')
 				materials.head(exec, repo, request.number, function(head, problem)
 					if not head or not oid(head) then finish(nil, problem or '无法确认远端 PR head。'); return end
-					if request.approval == 'preview' then finish(nil, nil, nil, nil, head); return end
 					local expected = request.version or latest
 					if expected and expected ~= head then moved(expected, head); return end
 					choose(head)

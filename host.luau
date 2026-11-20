@@ -15,7 +15,7 @@ type Row = github.Row
 type Identity = maintenance.Identity
 type Prefs = { filters: Filters, selected: number?, position: number?, repoId: string?, viewerId: string? }
 type Saved = { checkout: string?, repo: string?, kind: string, filtersByRepo: { [string]: { [string]: Prefs } }, maintenanceByRepo: { [string]: any }? }
-type Confirm = { kind: string, number: number, head: string, retained: string?, approval: boolean? }
+type Confirm = { kind: string, number: number, head: string, retained: string? }
 type Editor = { key: string, text: string, caret: number, error: string? }
 type Listing = { data: {rows: {Row}, uncertain: number}, position: number }
 type Scope = { identity: Identity, snapshot: any?, checked: number?, loading: boolean?, hydrated: boolean?,
@@ -291,23 +291,21 @@ local function choosePosition(state: State, index: number)
 	end
 end
 
-local function openTask(state: State, cx: BlockCx, kind: string, number: number, version: string?, retained: boolean?,
-	approval: ("preview" | "inherit")?)
+local function openTask(state: State, cx: BlockCx, kind: string, number: number, version: string?, retained: boolean?)
 	local repo, checkout = state.repo, state.saved.checkout
 	if not repo or not checkout or state.opening or (kind ~= ISSUE and kind ~= PR) then return end
 	state.opening, state.confirm, state.taskError, state.progress = number, nil, nil, "准备任务 #" .. number .. "…"
 	sessions.open(runtime.exec, { repo = repo, checkout = checkout, kind = kind, number = number, pane = cx.pane,
-		version = version, retained = retained, approval = approval },
+		version = version, retained = retained },
 		function(message)
 			if not runtime.alive(cx.pane) then return end
 			state.progress = message
 			cx:render()
-		end, function(message, err, changedHead, retainedHead, approvalHead)
+		end, function(message, err, changedHead, retainedHead)
 			state.opening = nil
 			if not runtime.alive(cx.pane) then return end
 			state.progress, state.taskError = message, err
-			state.confirm = if approvalHead then { kind = kind, number = number, head = approvalHead, approval = true }
-				elseif changedHead then { kind = kind, number = number, head = changedHead, retained = retainedHead } else nil
+			state.confirm = if changedHead then { kind = kind, number = number, head = changedHead, retained = retainedHead } else nil
 			cx:render()
 		end)
 end
@@ -558,15 +556,6 @@ local function taskDock(state: State, busy: boolean): { Node }
 	local dock: { Node } = {}
 	if state.progress then table.insert(dock, text(state.progress, if busy then "accent" else "muted")) end
 	if state.taskError then table.insert(dock, text(state.taskError, "warning")) end
-	local confirm = state.confirm
-	if confirm and confirm.approval then
-		table.insert(dock, text("PR #" .. confirm.number .. " · " .. confirm.head, "muted code"))
-		table.insert(dock, text("仅对这次启动生效。OMP 配置可能自动批准工具调用；只在信任此版本时继续。此确认不授权推送或其他 GitHub 写入。", "warning"))
-		table.insert(dock, ui.row({ button("信任此版本并按 OMP 审批配置打开",
-			"inherit_approval=" .. state.generation .. ":" .. confirm.number .. ":" .. confirm.head),
-			button("取消", "cancel_approval") }))
-		return dock
-	end
 	if state.confirm then
 		local choices = {}
 		if state.confirm.retained then table.insert(choices, button("保留并打开旧版本 " .. state.confirm.retained:sub(1, 8), "previous")) end
@@ -699,13 +688,8 @@ local function view(state: State, cx: BlockCx): BlockView
 				.. (if current and data.uncertain == 0 then "" else " 已找到 · 覆盖未确认")) }))
 	end
 	local dock = taskDock(state, busy)
-	if kind == PR and selected then
-		local target = state.generation .. ":" .. selected.number
-		local actions = { button("按 OMP 审批配置打开…", "preview_approval=" .. target, false, busy or state.confirm ~= nil) }
-		if selected.state == "OPEN" then
-			table.insert(actions, button("复制推送命令", "push_command=" .. target, false, busy))
-		end
-		table.insert(dock, ui.row(actions))
+	if kind == PR and selected and selected.state == "OPEN" then
+		table.insert(dock, button("复制推送命令", "push_command=" .. state.generation .. ":" .. selected.number, false, busy))
 	end
 	if not state.confirm and not busy then
 		table.insert(dock, text("↑↓ 选择 · Enter / 单击打开 · Tab 切换 · / 标题 · R 刷新"))
@@ -776,19 +760,9 @@ local block: BlockDef<State> = {
 			end
 			return
 		end
-		if action == "inherit_approval" or action == "cancel_approval" then
-			local confirm = state.confirm
-			if not confirm or not confirm.approval then return end
-			if action == "cancel_approval" then
-				state.confirm = nil
-			elseif value == state.generation .. ":" .. confirm.number .. ":" .. confirm.head then
-				openTask(state, cx, PR, confirm.number, confirm.head, nil, "inherit")
-			end
-			return
-		end
 		if action == "new_version" or action == "previous" then
 			local change = state.confirm
-			if not change or change.approval then return end
+			if not change then return end
 			if action == "new_version" then openTask(state, cx, change.kind, change.number, change.head)
 			elseif change.retained then openTask(state, cx, change.kind, change.number, change.retained, true) end
 			return
@@ -823,14 +797,10 @@ local block: BlockDef<State> = {
 			return
 		end
 		if not repo then return end
-		if action == "preview_approval" or action == "push_command" then
+		if action == "push_command" then
 			local selected, checkout = list and list.data.rows[list.position], state.saved.checkout
-			if state.saved.kind ~= PR or not selected or not checkout or value ~= state.generation .. ":" .. selected.number then return end
-			if action == "preview_approval" then
-				if not state.confirm then openTask(state, cx, PR, selected.number, nil, nil, "preview") end
-				return
-			end
-			if selected.state ~= "OPEN" then return end
+			if state.saved.kind ~= PR or not selected or selected.state ~= "OPEN" or not checkout
+				or value ~= state.generation .. ":" .. selected.number then return end
 			state.opening, state.confirm, state.taskError, state.progress = selected.number, nil, nil, "正在只读核对 PR 推送目标…"
 			sessions.pushCommand(runtime.exec, repo, checkout, selected.number, function(command, target, err)
 				state.opening = nil
