@@ -6,6 +6,7 @@ description = "GitHub Issue and PR workbench for omp"
 icon = "git-branch"
 host = "host.luau"
 window = "window.luau"
+styles = ["workbench.css"]
 
 [[blocks]]
 id = "workbench"

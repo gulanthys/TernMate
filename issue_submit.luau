@@ -8,17 +8,18 @@ type Field = {
 	kind: string, id: string, label: string, description: string?, placeholder: string?,
 	value: string?, required: boolean?, options: {string}?, default: number?, render: string?,
 }
-type Form = { id: string, version: string, name: string, description: string?, prefix: string, fields: {Field}, labels: {string}, blank: boolean? }
+type Form = { id: string, version: string, name: string, description: string?, prefix: string, fields: {Field},
+	labels: {string}, labelIds: {string}?, blank: boolean? }
 type Draft = { form: string, version: string, title: string, fields: {[string]: string} }
-type Editor = {field: string, text: string, caret: number, multiline: boolean, placeholder: string?}
+type Editor = {field: string, text: string, caret: number, multiline: boolean, placeholder: string?, saved: string?, stale: boolean?}
 local submit = {}
 
 local repository = "repository(owner:$owner,name:$name)"
 local repoArgs = "$owner:String!,$name:String!"
 local identityFields = "id nameWithOwner url visibility hasIssuesEnabled isFork parent{id} defaultBranchRef{name target{oid}}"
-local issueFields = "id number url title state createdAt author{login}"
+local issueFields = "id number url title state createdAt author{login ... on User{id}}"
 local templateQuery = "query(" .. repoArgs .. [=[,$dir:String!,$root:String!,$dot:String!,$docs:String!){
- viewer{login}
+ viewer{id login}
  ]=] .. repository .. "{" .. identityFields .. [=[
  viewerPermission
  dir:object(expression:$dir){oid ... on Tree{entries{name mode object{oid ... on Blob{byteSize isBinary isTruncated text}}}}}
@@ -167,19 +168,45 @@ local function numberInUrl(repo: runtime.Repo, url: any): number?
 	return tonumber(digits)
 end
 
+-- Stored external receipts contain the same issue fields returned by GitHub.
+-- Do not authorize removal with a partial record or a URL for a different issue.
+local function validReceipt(repo: runtime.Repo, issue: any): boolean
+	return type(issue) == "table" and type(issue.id) == "string" and issue.id ~= ""
+		and type(issue.number) == "number" and numberInUrl(repo, issue.url) == issue.number
+		and issue.url:lower() == repoUrl(repo):lower() .. "/issues/" .. tostring(issue.number)
+		and type(issue.title) == "string" and runtime.trim(issue.title) ~= ""
+		and (issue.state == "OPEN" or issue.state == "CLOSED")
+		and type(issue.createdAt) == "string" and issue.createdAt:match("^%d%d%d%d%-%d%d%-%d%dT%d%d:%d%d:%d%dZ$") ~= nil
+end
+
 local function matchesIdentity(repo: runtime.Repo, identity: any, data: any): boolean
 	local r = data.repository
 	return type(r) == "table" and r.id == identity.repoId and type(r.nameWithOwner) == "string"
-		and r.nameWithOwner:lower() == path(repo):lower() and type(data.viewer) == "table" and data.viewer.login == identity.viewer
+		and r.nameWithOwner:lower() == path(repo):lower() and type(data.viewer) == "table"
+		and data.viewer.id == identity.viewerId and data.viewer.login == identity.viewer
 end
 
-local function graphql(ctx: any, query: string, vars: {[string]: any}, done: Callback)
+local function graphql(ctx: any, identity: any, query: string, vars: {[string]: any}, done: Callback)
 	vars.owner, vars.name = ctx.repo.owner, ctx.repo.name
 	runtime.exec({"gh", "api", "graphql", "--hostname", ctx.repo.host, "--method", "POST", "--input", "-"},
 		{stdin=tern.json.encode({query=query, variables=vars})}, function(raw, err)
+			if not ctx.alive() then return end
 			local value, why = runtime.json(raw, err)
 			if not value or type(value.data) ~= "table" or (type(value.errors) == "table" and #value.errors > 0) then
-				done(nil, why or "GitHub 返回了不完整的查询结果。")
+				-- An error may be limited to the template/label query, or the
+				-- active account may no longer have repository access. Do not
+				-- fall back to private local records without rechecking.
+				ctx.identity(function(info: any, identityErr: string?)
+					if not ctx.alive() then return end
+					if not info or info.repoId ~= identity.repoId or info.viewerId ~= identity.viewerId
+						or info.viewer ~= identity.viewer then
+						ctx.revoke(identityErr)
+						return
+					end
+					done(nil, why or "GitHub 返回了不完整的查询结果。")
+				end)
+			elseif not matchesIdentity(ctx.repo, identity, value.data) then
+				ctx.revoke()
 			else done(value.data, nil) end
 		end)
 end
@@ -211,9 +238,9 @@ local function eligibleLabels(ctx: any, identity: any, forms: {Form}, canTriage:
 	if #names == 0 or #names > 60 then done({}, nil); return end
 	local vars: {[string]: any} = {}
 	for _, name in names do vars[keys[name]] = name end
-	graphql(ctx, "query(" .. repoArgs .. table.concat(declarations) .. "){viewer{login} " .. repository
+	graphql(ctx, identity, "query(" .. repoArgs .. table.concat(declarations) .. "){viewer{id login} " .. repository
 		.. "{id nameWithOwner viewerPermission " .. table.concat(selections, " ") .. "}}", vars, function(data, err)
-			if not data or not matchesIdentity(ctx.repo, identity, data) then done(nil, err or "标签核对时仓库或账号已变化。"); return end
+			if not data then done(nil, err); return end
 			local labels = {}
 			if ({ADMIN=true, MAINTAIN=true, WRITE=true, TRIAGE=true})[data.repository.viewerPermission] then
 				for _, name in names do
@@ -230,10 +257,10 @@ local function inspect(ctx: any, identity: any, done: Callback)
 	local branch = identity.defaultBranch
 	if type(branch) ~= "string" then done(nil, "无法核对默认分支；请使用 GitHub 原生入口。"); return end
 	local ref = "refs/heads/" .. branch .. ":"
-	graphql(ctx, templateQuery, {dir=ref .. ".github/ISSUE_TEMPLATE", root=ref .. "ISSUE_TEMPLATE.md",
+	graphql(ctx, identity, templateQuery, {dir=ref .. ".github/ISSUE_TEMPLATE", root=ref .. "ISSUE_TEMPLATE.md",
 		dot=ref .. ".github/ISSUE_TEMPLATE.md", docs=ref .. "docs/ISSUE_TEMPLATE.md"}, function(data, err)
 		if not ctx.alive() then return end
-		if not data or not matchesIdentity(ctx.repo, identity, data) then done(nil, err or "模板读取期间仓库或账号已变化。"); return end
+		if not data then done(nil, err); return end
 		local r = data.repository
 		if r.hasIssuesEnabled ~= true or r.visibility ~= identity.visibility or r.isFork ~= identity.isFork
 			or type(r.defaultBranchRef) ~= "table" or r.defaultBranchRef.name ~= branch then
@@ -318,6 +345,7 @@ local function inspect(ctx: any, identity: any, done: Callback)
 					for _, label in form.labels do if labelIds and labelIds[label] then table.insert(ids, labelIds[label]) end end
 					if #ids == #form.labels then
 						form.version ..= "\n" .. table.concat(ids, ",")
+						form.labelIds = if #ids > 0 then ids else nil
 						table.insert(menu.forms, form)
 					else table.insert(menu.native, form.name .. "：无法按模板安全应用标签；请在 GitHub 填写。") end
 				end
@@ -368,16 +396,15 @@ end
 local function receiptIssue(ctx: any, identity: any, url: string, done: Callback)
 	local number = numberInUrl(ctx.repo, url)
 	if not number then done(nil, "只接受当前目标仓库的 HTTPS Issue URL（不是 PR）。"); return end
-	graphql(ctx, "query(" .. repoArgs .. ",$number:Int!){viewer{login} " .. repository
+	graphql(ctx, identity, "query(" .. repoArgs .. ",$number:Int!){viewer{id login} " .. repository
 		.. "{id nameWithOwner issueOrPullRequest(number:$number){__typename ... on Issue{" .. issueFields .. "}}}}", {number=number}, function(data, err)
-			if not data or not matchesIdentity(ctx.repo, identity, data) then done(nil, err or "回查期间仓库或账号已变化。"); return end
+			if not data then done(nil, err); return end
 			local i = data.repository.issueOrPullRequest
-			if type(i) ~= "table" or i.__typename ~= "Issue" or i.number ~= number or numberInUrl(ctx.repo, i.url) ~= number
-				or type(i.id) ~= "string" or type(i.title) ~= "string" or type(i.createdAt) ~= "string"
-				or (i.state ~= "OPEN" and i.state ~= "CLOSED") then
+			if not validReceipt(ctx.repo, i) or i.__typename ~= "Issue" or i.number ~= number then
 				done(nil, "未能确认此链接是目标仓库内的 Issue。")
 			else done({id=i.id, number=i.number, url=i.url, title=i.title, state=i.state,
-				author=if type(i.author)=="table" then i.author.login else nil, createdAt=i.createdAt}, nil) end
+				author=if type(i.author)=="table" then i.author.login else nil,
+				authorId=if type(i.author)=="table" then i.author.id else nil, createdAt=i.createdAt}, nil) end
 		end)
 end
 
@@ -385,11 +412,11 @@ local function duplicates(ctx: any, identity: any, words: string, done: Callback
 	-- Only a single literal title phrase crosses the network, not the draft or ad hoc qualifiers.
 	if #words > 200 or words:find('["\\%c]') then done(nil, "标题关键词最多 200 字节，不能包含引号、反斜杠或控制字符。"); return end
 	local phrase = 'repo:' .. path(ctx.repo) .. ' is:issue in:title "' .. words .. '"'
-	graphql(ctx, "query(" .. repoArgs .. ",$phrase:String!){viewer{login} " .. repository
+	graphql(ctx, identity, "query(" .. repoArgs .. ",$phrase:String!){viewer{id login} " .. repository
 		.. "{id nameWithOwner} search(query:$phrase,type:ISSUE,first:30){issueCount pageInfo{hasNextPage} nodes{ ... on Issue {"
 		.. issueFields .. " repository{id} } }}}", {phrase=phrase}, function(data, err)
 			local result = data and data.search
-			if not data or not matchesIdentity(ctx.repo, identity, data) or type(result) ~= "table" or type(result.nodes) ~= "table"
+			if not data or type(result) ~= "table" or type(result.nodes) ~= "table"
 				or type(result.pageInfo) ~= "table" or type(result.pageInfo.hasNextPage) ~= "boolean" then
 				done(nil, err or "没有获得完整的标题搜索响应。"); return
 			end
@@ -404,7 +431,7 @@ local function duplicates(ctx: any, identity: any, words: string, done: Callback
 end
 
 local function matchesAttempt(issue: any, attempt: any): boolean
-	return issue.title == attempt.title and type(issue.author) == "string" and issue.author:lower() == attempt.viewer:lower()
+	return issue.title == attempt.title and issue.authorId == attempt.viewerId
 		and type(issue.createdAt) == "string" and issue.createdAt >= attempt.after and issue.createdAt <= attempt.before
 end
 
@@ -412,12 +439,12 @@ local function reconcile(ctx: any, identity: any, attempt: any, done: Callback)
 	local found, seen = {}, {}
 	local function page(after: string?)
 		if not ctx.alive() then return end
-		graphql(ctx, "query(" .. repoArgs .. ",$cursor:String){viewer{login} " .. repository
+		graphql(ctx, identity, "query(" .. repoArgs .. ",$cursor:String){viewer{id login} " .. repository
 			.. "{id nameWithOwner issues(first:50,after:$cursor,orderBy:{field:CREATED_AT,direction:DESC}){pageInfo{hasNextPage endCursor} nodes{"
 			.. issueFields .. "}}}}", {cursor=after}, function(data, err)
 				if not ctx.alive() then return end
 				local list = data and type(data.repository) == "table" and data.repository.issues
-				if not data or not matchesIdentity(ctx.repo, identity, data) or type(list) ~= "table"
+				if not data or type(list) ~= "table"
 					or type(list.nodes) ~= "table" or type(list.pageInfo) ~= "table" or type(list.pageInfo.hasNextPage) ~= "boolean" then
 					done(nil, err or "无法完整核对提交回执。"); return
 				end
@@ -427,8 +454,8 @@ local function reconcile(ctx: any, identity: any, attempt: any, done: Callback)
 					end
 					seen[issue.id] = true
 					if issue.createdAt < attempt.after then done(found, nil); return end
-					local author = if type(issue.author) == "table" then issue.author.login else nil
-					if matchesAttempt({title=issue.title, author=author, createdAt=issue.createdAt}, attempt)
+					local authorId = if type(issue.author) == "table" then issue.author.id else nil
+					if matchesAttempt({title=issue.title, authorId=authorId, createdAt=issue.createdAt}, attempt)
 						and type(issue.number) == "number" and numberInUrl(ctx.repo, issue.url) == issue.number then table.insert(found, issue) end
 				end
 				if not list.pageInfo.hasNextPage then done(found, nil); return end
@@ -454,23 +481,16 @@ local function iso(timestamp: number): string
 	return os.date("!%Y-%m-%dT%H:%M:%SZ", timestamp) :: string
 end
 
-local function rejected(raw: runtime.Result?): boolean
-	-- Everything not known to precede a successful create is ambiguous, even nonzero exits.
-	if not raw or raw.timed_out or raw.status == 0 or runtime.trim(raw.stdout) ~= "" then return false end
-	local msg = runtime.trim(raw.stderr):lower()
-	return msg:match("^graphql: title can't be blank %(createissue%)$") ~= nil
-		or msg:match("^graphql: title is too long %(createissue%)$") ~= nil
-		or msg:match("^could not create issue: graphql: title can't be blank %(createissue%)$") ~= nil
-		or msg:match("^could not create issue: graphql: title is too long %(createissue%)$") ~= nil
-		or msg == "title can't be blank"
-		or msg:match("^the '[%w_.%/-]+' repository has disabled issues$") ~= nil
-end
-
 local function sameDraft(a: any, b: Draft): boolean
 	if type(a) ~= "table" or a.form ~= b.form or a.version ~= b.version or a.title ~= b.title or type(a.fields) ~= "table" then return false end
 	for k, v in a.fields do if b.fields[k] ~= v then return false end end
 	for k, v in b.fields do if a.fields[k] ~= v then return false end end
 	return true
+end
+
+local function validDraft(value: any): boolean
+	return type(value) == "table" and type(value.form) == "string" and type(value.version) == "string"
+		and type(value.title) == "string" and type(value.fields) == "table"
 end
 
 function submit.new(ctx: any)
@@ -481,6 +501,8 @@ function submit.new(ctx: any)
 	local slot, serial = 1, 0
 	local busy, problem, note = nil :: string?, nil :: string?, nil :: string?
 	local mode = "load"
+	local cleanupPending = false
+	local historyWarning: string? = nil
 	local keywords = ""
 	local searchSerial = 0
 	local matches, reconciliation = nil :: any, nil :: any
@@ -526,9 +548,23 @@ function submit.new(ctx: any)
 	end
 
 	local function resetTransient()
+		cleanupPending = false
+		historyWarning = nil
 		preview, matches, reconciliation, selectedIssue, templateChoice = nil, nil, nil, nil, nil
 		keywords = ""
 		clearEditor()
+	end
+
+	-- The immutable external lock prevents further writes to this slot.
+	-- Keep its receipt usable even if deleting the draft needs another try.
+	local function cleanupExternalDraft()
+		cleanupPending, busy = true, "正在清理已关联的本地草稿…"
+		render()
+		store("draft", "remove", nil, function(_, err)
+			if not ctx.alive() then return end
+			cleanupPending = err ~= nil
+			finish(if err then "回执已保存，但本地草稿未清理：" .. err else nil)
+		end)
 	end
 
 	local function loadLocal()
@@ -538,22 +574,39 @@ function submit.new(ctx: any)
 			store("next", "read", nil, function(nextSlot, nextErr)
 				if not ctx.alive() then return end
 				if nextErr then finish(nextErr); return end
-				if nextSlot then
-					if nextSlot.to ~= slot + 1 then finish("草稿记录不连续，无法继续。"); return end
+				local historical = nextSlot ~= nil
+				if historical and (type(nextSlot) ~= "table" or nextSlot.to ~= slot + 1) then
+					finish("草稿记录不连续，无法继续。"); return
+				end
+				local function advance(warning: string?)
+					if not ctx.alive() then return end
+					if warning and not historyWarning then
+						historyWarning = "历史槽位 " .. slot .. "：" .. warning .. "。重新读取本地记录时会重试。"
+					end
 					slot += 1
 					tern.timer(0, readSlot)
-					return
 				end
 				store("lock", "read", nil, function(lock, lockErr)
 					if not ctx.alive() then return end
+					if historical then
+						if lockErr or type(lock) ~= "table" then advance("无法读取提交锁；未清理草稿")
+						elseif lock.kind ~= "external" then advance(nil)
+						elseif not validReceipt(ctx.repo, lock.issue) then advance("关联回执无效；未清理草稿")
+						else
+							store("draft", "remove", nil, function(_, err)
+								advance(if err then "关联回执已保存，但草稿清理失败：" .. err else nil)
+							end)
+						end
+						return
+					end
 					if lockErr then finish(lockErr); return end
+					if lock ~= nil and type(lock) ~= "table" then finish("本地提交锁无效；未清理草稿。"); return end
 					attempt, result, candidate, draft = lock, nil, nil, nil
 					local function readDraft()
 						store("draft", "read", nil, function(value, draftErr)
 							if not ctx.alive() then return end
 							if draftErr then finish(draftErr); return end
-							if value and (type(value.form) ~= "string" or type(value.version) ~= "string"
-								or type(value.title) ~= "string" or type(value.fields) ~= "table") then
+							if value and not validDraft(value) then
 								finish("本地草稿无法读取；未尝试发送。"); return
 							end
 							draft = value
@@ -565,12 +618,13 @@ function submit.new(ctx: any)
 						end)
 					end
 					if not lock or lock.kind == "discard" then readDraft(); return end
-					if lock.kind == "external" and type(lock.issue) == "table" then
+					if lock.kind == "external" then
+						if not validReceipt(ctx.repo, lock.issue) then finish("关联回执无效；未清理草稿。"); return end
 						result, mode = {kind="receipt", issue=lock.issue}, "receipt"
-						finish(nil); return
+						cleanupExternalDraft(); return
 					end
 					if lock.kind ~= "attempt" or type(lock.title) ~= "string" or type(lock.time) ~= "number"
-						or type(lock.viewer) ~= "string" or type(lock.after) ~= "string" or type(lock.before) ~= "string" then
+						or lock.viewerId ~= identity.viewerId or type(lock.after) ~= "string" or type(lock.before) ~= "string" then
 						finish("本地提交锁无法读取；不会重新发送。"); return
 					end
 					store("result", "read", nil, function(savedResult, resultErr)
@@ -594,10 +648,12 @@ function submit.new(ctx: any)
 		readSlot()
 	end
 
-	local function refresh()
+	local function refresh(message: string?)
 		resetTransient()
 		mode, menu, slot = "load", nil, 1
 		work("正在核对 GitHub 身份和本地草稿…")
+		note = message
+		if note then render() end
 		freshIdentity(ctx, function(info, err)
 			if not ctx.alive() then return end
 			if not info then identity = nil; finish(err); return end
@@ -608,38 +664,53 @@ function submit.new(ctx: any)
 				loadLocal()
 				if inspectErr then
 					-- Local records and verified receipts remain available even when templates cannot be read.
-					note = inspectErr
+					note = if message then message .. " " .. inspectErr else inspectErr
 					render()
 				end
 			end)
 		end)
 	end
 
-	local function saveDraft(nextDraft: Draft, onDone: (() -> ())?)
+	local function saveDraft(nextDraft: Draft, onDone: (() -> ())?, selection: string?)
 		work("正在保存私有草稿…")
-		store("lock", "read", nil, function(lock, lockErr)
+		store("draft", "draft-save", {expected=draft, replacement=nextDraft}, function(reply, err)
 			if not ctx.alive() then return end
-			if lockErr then finish(lockErr); return end
-			if lock then refresh(); return end
-			store("draft", "write", nextDraft, function(_, writeErr)
-				if writeErr then finish(writeErr); return end
-				store("lock", "read", nil, function(latest, latestErr)
-					if latestErr then finish(latestErr); return end
-					if latest and (latest.kind == "discard" or latest.kind == "external") then
-						-- An older open panel must not restore a draft after another discards or links it.
-						store("draft", "remove", nil, function(_, removeErr)
-							if not ctx.alive() then return end
-							if removeErr then finish(removeErr) else refresh() end
-						end)
-					elseif ctx.alive() then
-						if latest then refresh(); return end
-						draft = nextDraft
-						preview = nil
-						if onDone then onDone() end
-						finish(nil)
+			if err then finish(err); return end
+			if reply and reply.status == "saved" then
+				draft, preview, selectedIssue = nextDraft, nil, nil
+				if onDone then onDone() end
+				finish(nil)
+				return
+			end
+			if not reply or (reply.status ~= "conflict" and reply.status ~= "locked") then
+				finish("无法核对草稿保存结果。")
+				return
+			end
+			local latest = reply.draft
+			local edit = editor
+			if validDraft(latest) then
+				draft, preview, templateChoice, selectedIssue = latest, nil, nil, nil
+				if not edit then
+					finish("另一工作台已保存草稿。已载入新版；请核对后重新选择「" .. (selection or "") .. "」。")
+					return
+				end
+				local form = currentForm()
+				if form and latest.form == nextDraft.form and latest.version == nextDraft.version then
+					local value = if edit.field == "@title" then latest.title else latest.fields[edit.field] or ""
+					for _, field in form.fields do
+						if field.id == edit.field then value = fieldValue(latest, field); break end
 					end
-				end)
-			end)
+					edit.saved = value
+					finish("另一工作台已保存草稿。本次输入未写入；请核对已保存值，再决定是否保存此字段。")
+					return
+				end
+			end
+			if edit then
+				edit.stale = true
+				finish("草稿模板已变化或此草稿已锁定。本次输入未写入；可复制后重新读取。")
+			else
+				refresh("草稿已变化或锁定；未应用「" .. (selection or "") .. "」。")
+			end
 		end)
 	end
 
@@ -647,9 +718,9 @@ function submit.new(ctx: any)
 		if not draft or draft.form == form.id then
 			local old = draft
 			saveDraft({form=form.id, version=form.version, title=if old then old.title else "",
-				fields=if old then table.clone(old.fields) else {}}, function() templateChoice = nil end)
+				fields=if old then table.clone(old.fields) else {}}, function() templateChoice = nil end, form.name)
 		else
-			saveDraft({form=form.id, version=form.version, title=draft.title, fields={}}, function() templateChoice = nil end)
+			saveDraft({form=form.id, version=form.version, title=draft.title, fields={}}, function() templateChoice = nil end, form.name)
 		end
 	end
 
@@ -686,6 +757,17 @@ function submit.new(ctx: any)
 		else advance() end
 	end
 
+	local function settleDraft(lock: any, conflict: string, onSettled: () -> ())
+		store("lock", "draft-settle", {expected=draft, replacement=lock}, function(reply, err)
+			if reply and reply.status == "settled" then onSettled(); return end
+			if not ctx.alive() then return end
+			if err then finish(err)
+			elseif reply and reply.status == "conflict" then refresh(conflict)
+			elseif reply and reply.status == "locked" then refresh("此草稿已锁定；未应用本次操作。")
+			else finish("无法核对草稿操作结果。") end
+		end)
+	end
+
 	local function discard()
 		work("正在丢弃本地草稿…")
 		local function remove()
@@ -697,15 +779,16 @@ function submit.new(ctx: any)
 			end)
 		end
 		if attempt and attempt.kind == "discard" then remove(); return end
-		store("lock", "create", {kind="discard"}, function(_, err)
-			if err then if ctx.alive() then refresh() end; return end
-			attempt = {kind="discard"}
+		settleDraft({kind="discard"}, "草稿已在另一工作台修改；未丢弃。请核对新版后重新确认。", function()
+			attempt, mode = {kind="discard"}, "discarded"
 			remove()
 		end)
 	end
 
-	local function saveResult(value: any)
+	local function saveReceipt(issue: any)
+		local value = {kind="receipt", issue=issue}
 		store("result", "create", value, function(_, err)
+			if not err then ctx.issueCreated() end
 			if not ctx.alive() then return end
 			if err then
 				-- An independently verified receipt may already have won the immutable result slot.
@@ -716,7 +799,7 @@ function submit.new(ctx: any)
 				return
 			end
 			result = value
-			mode = if value.kind == "receipt" then "receipt" else "rejected"
+			mode = "receipt"
 			finish(nil)
 		end)
 	end
@@ -732,54 +815,29 @@ function submit.new(ctx: any)
 				finish("Issue 的作者、时间或标题不符合此提交，请核对其他原件。")
 				return
 			end
-			saveResult({kind="receipt", issue=issue})
+			saveReceipt(issue)
 		end)
 	end
 
-	local function sendPrepared(approved: any)
-		local now = os.time()
-		local lock = {kind="attempt", title=approved.title, form=approved.form.id, version=approved.form.version,
-			viewer=identity.viewer, time=now, after=iso(now - 90), before=iso(now + 600)}
-		store("lock", "create", lock, function(_, lockErr)
-			if lockErr then
-				if ctx.alive() then
-					store("lock", "read", nil, function(existing, readErr)
-						if not ctx.alive() then return end
-						if existing then refresh() else finish(readErr or lockErr) end
-					end)
+	local function sendPrepared(approved: any, form: Form, confirmed: any)
+		work("正在用已确认的账号创建一次 Issue…")
+		-- The child verifies the pinned credential before taking the send lock.
+		-- It records the outcome without relying on this panel's callbacks.
+		ctx.createIssue(confirmed, slot, approved.draft, approved.title, approved.body, form.labelIds, function(outcome: string?)
+			if not ctx.alive() then return end
+			if outcome == "identity_changed" then
+				ctx.revoke("仓库、账号或可见性已变化；未发送创建请求。")
+			elseif outcome == "auth_unavailable" then
+				refresh("创建助手未能核对 GitHub 凭据，未发送。通过身份重查后须重新预览。")
+			elseif outcome == "storage_error" then
+				finish("无法核对或保存本地提交锁；未发送。")
+			else
+				refresh()
+				if outcome == "draft_changed" then note = "本地草稿已变化；未发送，请重新预览。"
+				elseif outcome == nil or outcome == "unknown" then note = "创建未取得可验证的回执；按本地提交锁状态处理。"
 				end
-				return
-			end
-			attempt, mode = lock, "pending"
-			-- Only this callback can invoke `gh issue create`, and only after the exclusive write.
-			store("draft", "read", nil, function(saved, readErr)
-				if not ctx.alive() or readErr or not sameDraft(saved, approved.draft) then
-					saveResult({kind="rejected", reason=readErr or (if ctx.alive()
-						then "草稿在确认后已变化；没有创建。重新预览后再决定。"
-						else "面板已关闭，未启动创建请求。")})
-					return
-				end
-				busy = "正在创建一次 Issue…"
 				render()
-				local argv = {"gh", "issue", "create", "--repo", ctx.repo.host .. "/" .. path(ctx.repo),
-					"--title", approved.title, "--body-file", "-"}
-				for _, label in approved.form.labels do table.insert(argv, "--label=" .. label) end
-				runtime.exec(argv, {stdin=approved.body, cwd="/", timeout_ms=30000}, function(raw, _)
-					local url = if raw then runtime.trim(raw.stdout) else ""
-					if numberInUrl(ctx.repo, url) then
-						-- Persist the URL before attempting network verification, also after panel closure.
-						store("candidate", "create", {url=url}, function(_, candidateErr)
-							candidate = url
-							if not ctx.alive() then return end
-							if candidateErr then finish(candidateErr) else verifyCandidate(url, false) end
-						end)
-					elseif rejected(raw) then
-						saveResult({kind="rejected", reason="GitHub 明确拒绝创建。请修改草稿或核对仓库设置。"})
-					else
-						finish("创建结果未知（可能已经成功）。核对回执，不要重新发送。")
-					end
-				end)
-			end)
+			end
 		end)
 	end
 
@@ -792,8 +850,9 @@ function submit.new(ctx: any)
 		freshIdentity(ctx, function(info, err)
 			if not ctx.alive() then return end
 			if not info then finish(err); return end
-			local same = info.repoId == identity.repoId and info.viewer == identity.viewer and info.visibility == identity.visibility
-				and info.isFork == identity.isFork and info.hasIssues == true and info.webUrl == identity.webUrl
+			local target = approved.target
+			local same = info.repoId == target.repoId and info.viewerId == target.viewerId and info.visibility == target.visibility
+				and info.isFork == target.isFork and info.hasIssues == true and info.webUrl == target.webUrl
 			identity = info
 			if not same then menu = nil; finish("目标身份、权限或可见性已变化；旧确认失效。"); return end
 			inspect(ctx, info, function(freshMenu, templateErr)
@@ -803,15 +862,7 @@ function submit.new(ctx: any)
 				if not latest or latest.version ~= approved.form.version then
 					finish(templateErr or "模板、默认分支或标签已变化；旧确认失效。"); return
 				end
-				store("draft", "read", nil, function(saved, readErr)
-					if not ctx.alive() then return end
-					if readErr then finish(readErr); return end
-					if not sameDraft(saved, approved.draft) then
-						mode, draft = if saved then "resume" else "edit", saved
-						finish("本地草稿已在另一面板变化；请重新预览。"); return
-					end
-					sendPrepared(approved)
-				end)
+				sendPrepared(approved, latest, info)
 			end)
 		end)
 	end
@@ -822,7 +873,7 @@ function submit.new(ctx: any)
 		local title, body, err = payload(current, form)
 		if not title or body == nil then finish(err); return end
 		serial += 1
-		preview, mode, problem = {serial=serial, draft=current, title=title, body=body, form=form}, "preview", nil
+		preview, mode, problem = {serial=serial, draft=current, title=title, body=body, form=form, target=identity}, "preview", nil
 		render()
 	end
 
@@ -840,7 +891,7 @@ function submit.new(ctx: any)
 
 	local function applyEditor()
 		local current, edit = draft, editor
-		if not edit then return end
+		if not edit or edit.stale then return end
 		local value = edit.text
 		if edit.field == "@keywords" then
 			keywords, matches = runtime.trim(value), nil
@@ -872,6 +923,12 @@ function submit.new(ctx: any)
 		nextDraft.fields = table.clone(current.fields)
 		if edit.field == "@title" then nextDraft.title = value else nextDraft.fields[edit.field] = value end
 		saveDraft(nextDraft, clearEditor)
+	end
+
+	local function cancelEditor()
+		if editor and editor.stale then refresh(); return end
+		clearEditor()
+		finish(nil)
 	end
 
 	local function checkResult(showSearch: boolean)
@@ -910,33 +967,31 @@ function submit.new(ctx: any)
 		if not issue then return end
 		selectedIssue = nil
 		work("正在保存已验证的原件…")
-		store("lock", "create", {kind="external", issue=issue}, function(_, err)
-			if err then
-				if ctx.alive() then refresh() end
-				return
-			end
-			store("draft", "remove", nil, function(_, removeErr)
-				if not ctx.alive() then return end
-				result, mode, draft = {kind="receipt", issue=issue}, "receipt", nil
-				finish(removeErr)
-			end)
+		settleDraft({kind="external", issue=issue}, "草稿已在另一工作台修改；未关联原件。请核对新版后重新确认。", function()
+			ctx.issueCreated()
+			result, mode, draft = {kind="receipt", issue=issue}, "receipt", nil
+			cleanupExternalDraft()
 		end)
 	end
 
 	function controller.event(action: string, value: string?)
 		if not ctx.alive() or busy then return end
+		if editor then
+			if action == "apply" then applyEditor()
+			elseif action == "cancel_edit" then cancelEditor()
+			elseif action == "copy_edit" and (editor.stale or editor.saved ~= nil) then ctx.cx:copy(editor.text) end
+			return
+		end
 		if action == "refresh" then refresh(); return end
 		if not identity or mode == "load" then return end
-		if editor and action ~= "apply" and action ~= "cancel_edit" then return end
-		if action == "apply" then applyEditor()
-		elseif action == "cancel_edit" then clearEditor(); render()
-		elseif action == "resume" and mode == "resume" then mode = "edit"; render()
+		if action == "resume" and mode == "resume" then mode = "edit"; render()
 		elseif action == "confirm" then confirm(value)
 		elseif action == "back_edit" and mode == "preview" then preview, mode = nil, "edit"; render()
 		elseif action == "discard_ask" and (mode == "resume" or mode == "edit") and draft then mode = "discard_confirm"; render()
 		elseif action == "discard_cancel" and mode == "discard_confirm" then mode = "resume"; render()
 		elseif action == "discard" and (mode == "discard_confirm" or mode == "discarded") then discard()
-		elseif action == "next" and mode == "receipt" then nextSlot(nil)
+		elseif action == "cleanup_external" and mode == "receipt" and cleanupPending then cleanupExternalDraft()
+		elseif action == "next" and mode == "receipt" and not cleanupPending then nextSlot(nil)
 		elseif action == "revise" and mode == "rejected" then nextSlot(draft)
 		elseif action == "receipt_open" and mode == "receipt" and result and numberInUrl(ctx.repo, result.issue.url) then
 			ctx.cx:open(result.issue.url)
@@ -1006,7 +1061,7 @@ function submit.new(ctx: any)
 							local nextDraft = table.clone(current)
 							nextDraft.fields = table.clone(current.fields)
 							nextDraft.fields[field.id] = field.options[index] or ""
-							saveDraft(nextDraft, nil)
+							saveDraft(nextDraft, nil, field.options[index] or "不选")
 						end
 					end
 				end
@@ -1017,7 +1072,7 @@ function submit.new(ctx: any)
 	function controller.key(key: Key): boolean
 		local edit = editor
 		if not edit or busy then return false end
-		if key.name == "escape" then clearEditor(); render(); return true end
+		if key.name == "escape" then cancelEditor(); return true end
 		if (key.ctrl or key.meta) and key.name == "enter" then applyEditor(); return true end
 		if key.ctrl or key.meta or key.alt then return false end
 		local value, caret = edit.text, edit.caret
@@ -1056,7 +1111,19 @@ function submit.new(ctx: any)
 		end
 		table.insert(nodes, ui.node("input", {key="submit-input", text=left .. right, cursor=cursor, placeholder=edit.placeholder or "输入内容"}))
 		if edit.multiline and after ~= right then table.insert(nodes, text(after:sub(#right + 2))) end
-		table.insert(nodes, ui.row({button(if edit.field == "@url" then "验证 URL（只读）" elseif edit.field == "@keywords" then "保存关键词（不联网）" else "保存到本地", "apply", nil, busy ~= nil), button("取消本次编辑", "cancel_edit", nil, busy ~= nil)}))
+		if edit.saved ~= nil and not edit.stale then
+			table.insert(nodes, text("此字段已保存的值：" .. (if edit.saved == "" then "（空）" else edit.saved)))
+		end
+		local disabled = busy ~= nil
+		local actions: {Node} = {}
+		if not edit.stale then
+			local label = if edit.field == "@url" then "验证 URL（只读）" elseif edit.field == "@keywords" then "保存关键词（不联网）"
+				elseif edit.saved ~= nil then "用本次输入保存此字段" else "保存到本地"
+			table.insert(actions, button(label, "apply", nil, disabled))
+		end
+		if edit.stale or edit.saved ~= nil then table.insert(actions, button("复制本次输入", "copy_edit", nil, disabled)) end
+		table.insert(actions, button(if edit.stale then "放弃本次编辑并重新读取" else "取消本次编辑", "cancel_edit", nil, disabled))
+		table.insert(nodes, ui.row(actions))
 		return ui.card("", nodes, {key="submit-editor"})
 	end
 
@@ -1066,6 +1133,7 @@ function submit.new(ctx: any)
 		local function add(label: string, action: string, value: (string | number)?)
 			table.insert(nodes, button(label, action, value, disabled or editor ~= nil))
 		end
+		if historyWarning then table.insert(nodes, text(historyWarning, "warning")) end
 		local info = identity
 		if info then
 			table.insert(nodes, text(ctx.repo.host .. "/" .. path(ctx.repo) .. " · @" .. info.viewer .. " · " .. info.visibility, "strong"))
@@ -1121,13 +1189,15 @@ function submit.new(ctx: any)
 			if excluded then table.insert(nodes, text("当前筛选不显示此 Issue：" .. excluded .. "。返回时保留筛选。")) end
 			add("查看原件", "receipt_open", nil)
 			add("在 omp 分析", "receipt_omp", nil)
-			table.insert(nodes, ui.button("返回列表", {key="submit-list", size="sm", actions={click="mode=browse"}}))
-			add("开始一份新草稿", "next", nil)
+			table.insert(nodes, ui.button("返回列表", {key="submit-list", size="sm", actions={click="close_submit"}}))
+			if cleanupPending then add("重试清理本地草稿", "cleanup_external", nil)
+			else add("开始一份新草稿", "next", nil) end
 		elseif mode == "rejected" and result then
 			table.insert(nodes, text(result.reason or "请求没有创建 Issue。", "strong"))
 			add("继续编辑原草稿（需重新预览和确认）", "revise", nil)
 		elseif mode == "discard_confirm" or mode == "discarded" then
 			table.insert(nodes, text("丢弃只删除本地草稿，不向 GitHub 发送请求。"))
+			if draft then table.insert(nodes, text("将丢弃：" .. (if draft.title ~= "" then draft.title else "未命名"), "strong")) end
 			add("确认丢弃草稿", "discard", nil)
 			if mode == "discard_confirm" then add("保留草稿", "discard_cancel", nil) end
 		elseif mode == "edit" or mode == "resume" then
@@ -1142,7 +1212,7 @@ function submit.new(ctx: any)
 			if selectedIssue then
 				table.insert(nodes, text("已验证原件 #" .. selectedIssue.number .. " · " .. selectedIssue.title, "strong"))
 				table.insert(nodes, text(selectedIssue.url, "muted code"))
-				add("确认绑定原件（不创建）", "bind_external", selectedIssue.number)
+				add(if draft then "确认绑定原件并移除本地草稿" else "确认绑定原件（不创建）", "bind_external", selectedIssue.number)
 				add("不绑定", "decline_external", nil)
 			end
 			if menu then

@@ -3,7 +3,8 @@
 local runtime = require("./runtime")
 type Repo = runtime.Repo
 type Callback = (any, string?) -> ()
-type SyncCallback = (any, string?, boolean?) -> ()
+type SyncCallback = (any, string?, boolean?, boolean?) -> ()
+type Progress = ("issues" | "prs", {any}) -> ()
 type Nested = {name: string, first: number, fields: string, detail: string?}
 type Kind = {name: string, typename: string, scalars: string, keys: {string}, nested: {Nested}}
 export type Identity = {
@@ -132,9 +133,9 @@ local function hex(value: string): string
 	return (value:gsub(".", function(byte) return string.format("%02x", string.byte(byte)) end))
 end
 
-local function mirrorScope(repo: Repo, identity: Identity): string?
-	if type(identity.repoId) ~= "string" or identity.repoId == "" or type(identity.viewerId) ~= "string"
-		or identity.viewerId == "" or type(identity.viewer) ~= "string" or identity.viewer == "" then return nil end
+local function identityScope(repo: Repo, identity: any): string?
+	if repo.host == "" or type(identity) ~= "table" or type(identity.repoId) ~= "string" or identity.repoId == ""
+		or type(identity.viewerId) ~= "string" or identity.viewerId == "" then return nil end
 	local scope = hex(repo.host:lower()) .. "-" .. hex(identity.repoId) .. "-" .. hex(identity.viewerId)
 	return if #scope <= 240 then scope else nil
 end
@@ -212,38 +213,71 @@ local function sameScope(repo: Repo, identity: Identity, snapshot: any): boolean
 		and snapshot.repoId == identity.repoId and snapshot.viewerId == identity.viewerId and type(snapshot.observedAt) == "string"
 end
 
-local persisted: {[any]: boolean} = {}
+local persisted: {[any]: string} = {}
 setmetatable(persisted, {__mode = "k"})
 local revoked: {[string]: boolean} = {}
 local mirrorLimit = 128 * 1024 * 1024
 
-local function mirrorIO(scope: string, mode: string, stdin: string?, done: (runtime.Result?, string?) -> ())
-	runtime.exec({"/bin/sh", tern.plugin.dir .. "/maintenance-store.sh", tern.plugin.data, scope, "snapshot", mode},
+local function validGeneration(value: any): boolean
+	return type(value) == "string" and value:match("^%d+%-%w+$") ~= nil
+end
+
+local function validRevision(value: any): boolean
+	return type(value) == "string" and (value == "0" or value:match("^r[1-9]%d*$") ~= nil)
+end
+
+local function validEpoch(value: any): boolean
+	return type(value) == "number" and value > 0 and value % 1 == 0
+end
+
+local function mirrorIO(scope: string, mode: string, stdin: string?, done: (runtime.Result?, string?) -> (), ...: string)
+	runtime.exec({"/bin/sh", tern.plugin.dir .. "/maintenance-store.sh", tern.plugin.data, scope, "snapshot", mode, ...},
 		{stdin = stdin}, done)
 end
 
 function data.cached(repo: Repo, identity: Identity, done: Callback)
-	local scope = mirrorScope(repo, identity)
+	local scope = identityScope(repo, identity)
 	if not scope then done(nil, "本地镜像身份无效。"); return end
 	if revoked[scope] then done(nil, nil); return end
 	mirrorIO(scope, "mirror-probe", nil, function(raw, err)
 		if revoked[scope] then done(nil, nil); return end
 		if not raw or raw.status ~= 0 then done(nil, "无法打开本地镜像：" .. runtime.failure(raw, err)); return end
-		if runtime.trim(raw.stdout) == "false" then done(nil, nil); return end
-		if runtime.trim(raw.stdout) ~= "true" then done(nil, "本地镜像状态无效。"); return end
+		local probe = runtime.trim(raw.stdout)
+		if probe == "false" then done(nil, nil); return end
+		local revision, stamp = probe:match("^true\n([^\n]+)\n?(.*)$")
+		if not revision or not validRevision(revision) then done(nil, "本地镜像失效标记无效。"); return end
 		-- Process stdout is capped at 16 MiB. Read the atomic file itself, with a bound
 		-- that also rejects non-regular files and final-component symlinks.
 		local path = tern.plugin.data .. "/maintenance-mirror-v1/" .. scope .. "/snapshot.json"
-		local ok, text = pcall(tern.fs.read, path, mirrorLimit)
+		local ok, text = pcall(tern.fs.read, path, mirrorLimit + 128) -- Allow the generation envelope.
 		if not ok then done(nil, "无法读取本地镜像文件。"); return end
 		local value = runtime.decode(text)
+		local generation: string? = nil
+		if type(value) == "table" and validGeneration(value.generation) then
+			generation, value = value.generation, value.snapshot
+		end
 		if not sameScope(repo, identity, value) then done(nil, "本地镜像不完整或身份不符。"); return end
 		if value.repoUrl ~= identity.webUrl then done(nil, nil); return end
 		if not indexItems(issue, value.issues) or not indexItems(pr, value.prs) then
 			done(nil, "本地镜像不完整。"); return
 		end
 		value.viewer = identity.viewer -- Login can change; the cache key cannot.
-		persisted[value] = true
+		local confirmed = value.resultRevision or "0"
+		if generation then
+			local stamped, checked, reconciled, checkedRevision = (stamp or ""):match("^(%d+%-%w+) (%d+) (%d+) ?(%S*)$")
+			local checkedEpoch, reconciledEpoch = tonumber(checked), tonumber(reconciled)
+			-- Read and probe can straddle a concurrent replacement. Only trust a
+			-- stamp for the exact payload we read, never the prior generation.
+			if stamped == generation and validEpoch(checkedEpoch) and validEpoch(reconciledEpoch) then
+				value.reconciledEpoch = reconciledEpoch
+				if (if checkedRevision == "" then "0" else checkedRevision) == revision then
+					value.checkedEpoch, confirmed = checkedEpoch, revision
+				end
+			end
+			persisted[value] = generation
+		end
+		value.resultRevision = confirmed
+		if confirmed ~= revision then value.checkedEpoch = nil end
 		done(value, nil)
 	end)
 end
@@ -281,10 +315,8 @@ local function sameProbe(kind: Kind, a: any, b: any): boolean
 	return true
 end
 
-function data.sync(repo: Repo, identity: Identity, previous: any, isAlive: () -> boolean, done: SyncCallback, progress: ((any) -> ())?)
-	if not isAlive() then return end
-	local scope = mirrorScope(repo, identity)
-	if not scope then done(nil, "本地镜像身份无效。", true); return end
+local function syncScope(repo: Repo, identity: Identity, scope: string, revision: string, previous: any,
+	isAlive: () -> boolean, done: SyncCallback, progress: Progress?, lastVisible: any?)
 	local oldIssues: {[string]: any}? = nil
 	local oldPrs: {[string]: any}? = nil
 	if sameScope(repo, identity, previous) then
@@ -299,16 +331,27 @@ function data.sync(repo: Repo, identity: Identity, previous: any, isAlive: () ->
 		and previous.repoUrl == identity.webUrl
 	local snapshot: any = {host = repo.host:lower(), repoId = identity.repoId, repoUrl = identity.webUrl,
 		viewerId = identity.viewerId, viewer = identity.viewer, issues = {}, prs = {}, complete = false,
-		observedAt = os.date("!%Y-%m-%dT%H:%M:%SZ", now)}
-	local unchanged = warm and previous.viewer == identity.viewer
-	local remaining, reported = 2, 0
+		observedAt = os.date("!%Y-%m-%dT%H:%M:%SZ", now), resultRevision = revision}
+	local unchanged = oldIssues ~= nil and oldPrs ~= nil
+		and previous.repoUrl == identity.webUrl and previous.viewer == identity.viewer
+	local remaining = 2
 	local stopped = false
 	local identitySelection = "viewer{id login} " .. repository .. "{id nameWithOwner}"
 	local function alive(): boolean return not stopped and isAlive() end
-	local function fail(err: string, scopeChanged: boolean?)
+	local function fail(err: string?, scopeChanged: boolean?, revisionChanged: boolean?)
 		if not alive() then return end
 		stopped = true
-		done(nil, err, scopeChanged)
+		if scopeChanged or revisionChanged then
+			done(nil, err, scopeChanged, revisionChanged)
+			return
+		end
+		-- A new Issue can change the connection count before publication.
+		-- Detect that local invalidation even if pagination aborted first.
+		data.resultRevision(repo, identity, function(latest)
+			if not isAlive() then return end
+			if latest and latest ~= revision then done(nil, nil, nil, true)
+			else done(nil, err) end
+		end)
 	end
 	local function revoke()
 		revoked[scope] = true
@@ -337,24 +380,43 @@ function data.sync(repo: Repo, identity: Identity, previous: any, isAlive: () ->
 		snapshot.complete = true
 		snapshot.checkedEpoch = os.time()
 		snapshot.reconciledEpoch = if warm then lastReconciled else snapshot.checkedEpoch
-		local result = if unchanged then previous else snapshot
-		if persisted[result] and not revoked[scope] then stopped = true; done(result, nil); return end
-		local encoded, text = pcall(tern.json.encode, result)
-		if not encoded or #text > mirrorLimit then
-			stopped = true
-			done(result, "本地镜像无法编码或超过存储上限。")
-			return
-		end
-		mirrorIO(scope, "mirror-write", text, function(raw, err)
-			local saved = raw ~= nil and raw.status == 0
-			if saved then
-				persisted[result] = true
-				revoked[scope] = nil
-			end
+		local function settle(result: any, err: string?)
 			if not alive() then return end
 			stopped = true
-			done(result, if saved then nil else "无法保存本地镜像：" .. runtime.failure(raw, err))
-		end)
+			result.checkedEpoch, result.reconciledEpoch = snapshot.checkedEpoch, snapshot.reconciledEpoch
+			if not err then result.resultRevision = revision end
+			done(result, err)
+		end
+		local generation = if unchanged and not revoked[scope] then persisted[previous] else nil
+		if generation then
+			mirrorIO(scope, "mirror-stamp", nil, function(raw, err)
+				if not alive() then return end
+				if raw and raw.status == 5 then fail(nil, nil, true); return end
+				-- Missing/replaced payload: don't attach freshness to it or
+				-- overwrite it based on this stamp attempt. Retry on a later sync.
+				if raw and raw.status == 4 then persisted[previous] = nil end
+				settle(previous, if raw and raw.status == 0 then nil else "无法保存本地镜像核对时间：" .. runtime.failure(raw, err))
+			end, revision, generation, tostring(snapshot.checkedEpoch), tostring(snapshot.reconciledEpoch))
+			return
+		end
+		local encoded, text = pcall(tern.json.encode, snapshot)
+		if not encoded or #text > mirrorLimit then
+			settle(snapshot, "本地镜像无法编码或超过存储上限。")
+			return
+		end
+		if not alive() then return end
+		mirrorIO(scope, "mirror-write", text, function(raw, err)
+			if not alive() then return end
+			if raw and raw.status == 5 then fail(nil, nil, true); return end
+			if not raw or raw.status ~= 0 then
+				settle(snapshot, "无法保存本地镜像：" .. runtime.failure(raw, err)); return
+			end
+			local saved = runtime.trim(raw.stdout)
+			if not validGeneration(saved) then settle(snapshot, "本地镜像版本无效。"); return end
+			persisted[snapshot] = saved
+			revoked[scope] = nil
+			settle(snapshot, nil)
+		end, revision)
 	end
 	local function expand(kind: Kind, items: {any}, detail: boolean, ready: () -> ())
 		local jobs: {{item: any, spec: Nested, seen: {[string]: boolean}}} = {}
@@ -408,29 +470,65 @@ function data.sync(repo: Repo, identity: Identity, previous: any, isAlive: () ->
 		end
 		nextJob(1)
 	end
-	local function scan(kind: Kind, destination: {any}, old: {[string]: any}?, oldList: {any}?)
+	local function scan(kind: Kind, destination: {any}, old: {[string]: any}?)
 		local cursors: {[string]: boolean} = {}
 		local seen: {[string]: boolean} = {}
+		-- A failed scan can leave newer rows visible without changing the
+		-- complete mirror. Compare progress against those rows independently.
+		local visible = old
+		if lastVisible then
+			local rows: {[string]: any} = {}
+			for _, item in lastVisible[if kind == issue then "issues" else "prs"] do rows[item.id] = item end
+			visible = rows
+		end
 		local numbers: {[number]: boolean} = {}
 		local count: number? = nil
-		local inventoryFields = if warm then index .. (if kind == pr then " " .. prIndex else "") else fields(kind, true)
-		local query = "query(" .. repoArgs .. ",$cursor:String){viewer{id login} " .. repository .. "{id nameWithOwner " .. kind.name
-			.. "(first:" .. (if warm then "100" else "30") .. ",after:$cursor,orderBy:{field:CREATED_AT,direction:ASC}){totalCount "
-			.. paging .. " nodes{" .. inventoryFields .. "}}}}"
-		local function nodeQuery(detail: boolean): string
-			return "query(" .. repoArgs .. ",$ids:[ID!]!){" .. identitySelection
-				.. " nodes(ids:$ids){... on " .. kind.typename .. "{repository{id} " .. fields(kind, detail) .. "}}}"
+		local progressKind: "issues" | "prs" = if kind == issue then "issues" else "prs"
+		local detailFields = fields(kind, true)
+		local inventoryFields = if warm then index .. (if kind == pr then " " .. prIndex else "") else detailFields
+		local function pageQuery(first: number, selection: string): string
+			return "query(" .. repoArgs .. ",$cursor:String){viewer{id login} " .. repository .. "{id nameWithOwner " .. kind.name
+				.. "(first:" .. first .. ",after:$cursor,orderBy:{field:CREATED_AT,direction:DESC}){totalCount "
+				.. paging .. " nodes{" .. selection .. "}}}}"
 		end
-		local detailQuery = if warm then nodeQuery(true) else ""
-		local openProbeQuery = if warm and kind == pr then nodeQuery(false) else ""
-		local function resolve(inventory: {any}, complete: ({any}) -> ())
-			if not warm or not old then expand(kind, inventory, true, function() complete(inventory) end); return end
+		-- Start each connection with recent details, then continue the same
+		-- creation-ordered cursor without making warm scans fetch all details.
+		local firstQuery = pageQuery(20, detailFields)
+		local nextQuery = pageQuery(if warm then 100 else 30, inventoryFields)
+		-- Old mirrors can be ordered differently. Match by stable node ID.
+		local function publish(items: {any})
+			local updates: {any}? = nil
+			for _, item in items do
+				local prior = old and old[item.id]
+				if unchanged and not equal(item, prior) then unchanged = false end
+				if progress and not equal(item, visible and visible[item.id]) then
+					local batch = updates or {}
+					table.insert(batch, item)
+					updates = batch
+				end
+			end
+			if progress and updates and alive() then progress(progressKind, updates) end
+		end
+		local function nodeQuery(selection: string): string
+			return "query(" .. repoArgs .. ",$ids:[ID!]!){" .. identitySelection
+				.. " nodes(ids:$ids){... on " .. kind.typename .. "{repository{id} " .. selection .. "}}}"
+		end
+		local detailQuery = if warm then nodeQuery(detailFields) else ""
+		local openProbeQuery = if warm and kind == pr then nodeQuery(fields(kind, false)) else ""
+		local function resolve(inventory: {any}, detail: boolean, complete: ({any}) -> ())
+			if detail then
+				expand(kind, inventory, true, function()
+					publish(inventory)
+					if alive() then complete(inventory) end
+				end)
+				return
+			end
 			local items: {any} = table.create(#inventory)
 			local changed: {number} = {}
 			local open: {number} = {}
 			for position, entry in inventory do
-				local prior = old[entry.id]
-				if not prior or not sameIndex(entry, prior) then
+				local prior = old and old[entry.id]
+				if not prior or not sameIndex(entry, prior) or (lastVisible and visible and visible[entry.id] ~= prior) then
 					table.insert(changed, position)
 				else
 					items[position] = prior
@@ -455,6 +553,8 @@ function data.sync(repo: Repo, identity: Identity, previous: any, isAlive: () ->
 						end
 						expand(kind, value.nodes, detail, function()
 							for offset = 1, #ids do use(positions[first + offset - 1], value.nodes[offset]) end
+							if detail then publish(value.nodes) end
+							if not alive() then return end
 							local after = first + #ids
 							if after > #positions then ready() else tern.timer(0, function() batch(after) end) end
 						end)
@@ -462,10 +562,16 @@ function data.sync(repo: Repo, identity: Identity, previous: any, isAlive: () ->
 				end
 				batch(1)
 			end
-			load(open, false, function(position, observed)
-				if not sameProbe(kind, observed, items[position]) then table.insert(changed, position) end
-			end, function()
-				load(changed, true, function(position, item) items[position] = item end, function() complete(items) end)
+			local function useDetail(position: number, item: any) items[position] = item end
+			-- Publish known changes before probing unchanged open PRs for
+			-- reviews and checks that can move without an index change.
+			load(changed, true, useDetail, function()
+				table.clear(changed)
+				load(open, false, function(position, observed)
+					if not sameProbe(kind, observed, items[position]) then table.insert(changed, position) end
+				end, function()
+					load(changed, true, useDetail, function() complete(items) end)
+				end)
 			end)
 		end
 		local function confirmMissing()
@@ -498,7 +604,8 @@ function data.sync(repo: Repo, identity: Identity, previous: any, isAlive: () ->
 			batch(1)
 		end
 		local function page(cursor: string?)
-			request(query, {cursor = cursor}, function(value)
+			local detail = cursor == nil or not warm
+			request(if cursor == nil then firstQuery else nextQuery, {cursor = cursor}, function(value)
 				local current = value.repository[kind.name]
 				if not connection(current) or (count ~= nil and count ~= current.totalCount) then
 					fail("分页响应不完整或远端列表数量已变化。"); return
@@ -506,7 +613,7 @@ function data.sync(repo: Repo, identity: Identity, previous: any, isAlive: () ->
 				local expected: number = current.totalCount
 				count = expected
 				for position, item in current.nodes do
-					local valid = if warm then indexShape(kind, item) else itemShape(kind, item, true)
+					local valid = if detail then itemShape(kind, item, true) else indexShape(kind, item)
 					if type(position) ~= "number" or position < 1 or position > #current.nodes
 						or not valid or seen[item.id] or numbers[item.number] then
 						fail("扫描期间列表变化或对象身份缺失；请重新扫描。"); return
@@ -520,16 +627,8 @@ function data.sync(repo: Repo, identity: Identity, previous: any, isAlive: () ->
 					or (not hasNext and covered ~= expected) then
 					fail("列表游标不完整、重复或条目未读完；请重新扫描。"); return
 				end
-				resolve(current.nodes, function(items)
-					for _, item in items do
-						if unchanged and oldList and oldList[#destination + 1] ~= item then unchanged = false end
-						table.insert(destination, item)
-					end
-					local total = #snapshot.issues + #snapshot.prs
-					if progress and total > 0 and (reported == 0 or total - reported >= 150) then
-						reported = total
-						progress(snapshot)
-					end
+				resolve(current.nodes, detail, function(items)
+					for _, item in items do table.insert(destination, item) end
 					if not hasNext then confirmMissing(); return end
 					cursors[after] = true
 					tern.timer(0, function() page(after) end)
@@ -538,25 +637,65 @@ function data.sync(repo: Repo, identity: Identity, previous: any, isAlive: () ->
 		end
 		page(nil)
 	end
-	scan(issue, snapshot.issues, oldIssues, if oldIssues then previous.issues else nil)
-	scan(pr, snapshot.prs, oldPrs, if oldPrs then previous.prs else nil)
+	scan(issue, snapshot.issues, oldIssues)
+	scan(pr, snapshot.prs, oldPrs)
+end
+
+function data.resultRevision(repo: Repo, identity: Identity, done: (string?, string?) -> ())
+	local scope = identityScope(repo, identity)
+	if not scope then done(nil, "本地镜像身份无效。"); return end
+	-- Local read only: the immutable result records are the source of truth,
+	-- independently of whether the mirror directory can be written.
+	mirrorIO(scope, "mirror-revision", nil, function(raw, err)
+		if not raw or raw.status ~= 0 then done(nil, "无法核对本地提交结果版本：" .. runtime.failure(raw, err)); return end
+		local revision = runtime.trim(raw.stdout)
+		if not validRevision(revision) then done(nil, "本地提交结果版本无效。"); return end
+		done(revision, nil)
+	end)
+end
+
+function data.sync(repo: Repo, identity: Identity, previous: any, isAlive: () -> boolean, done: SyncCallback,
+	progress: Progress?, lastVisible: any?)
+	if not isAlive() then return end
+	local scope = identityScope(repo, identity)
+	if not scope then done(nil, "本地镜像身份无效。", true); return end
+	-- Capture the version before any GitHub read to fence out pre-receipt scans.
+	data.resultRevision(repo, identity, function(revision, err)
+		if not isAlive() then return end
+		if not revision then done(nil, err); return end
+		syncScope(repo, identity, scope, revision, previous, isAlive, done, progress, lastVisible)
+	end)
 end
 
 function data.store(repo: Repo, identity: any, key: string, mode: string, value: any, done: Callback)
 	if #key > 180 or not key:match("^[%w_-]+$") then done(nil, "私有记录键无效。"); return end
-	local scope = hex(repo.host) .. "-" .. hex(identity.repoId) .. "-" .. hex(identity.viewer:lower())
-	if #scope > 240 then done(nil, "私有记录身份过长。"); return end
-	local stdin = if mode == "write" or mode == "create" or mode == "append" then tern.json.encode(value) else nil
+	local scope = identityScope(repo, identity)
+	if not scope then done(nil, "私有记录身份无效。"); return end
+	local structured = mode == "draft-save" or mode == "draft-settle"
+	local stdin = if mode == "write" or mode == "create" or mode == "append" or structured then tern.json.encode(value) else nil
 	runtime.exec({"/bin/sh", tern.plugin.dir .. "/maintenance-store.sh", tern.plugin.data, scope, key, mode}, {stdin = stdin}, function(raw, err)
 		if not raw or raw.status ~= 0 then
 			done(nil, if raw and raw.status == 3 then "该记录已存在或无法独占创建。" else "私有记录操作失败：" .. runtime.failure(raw, err))
 			return
 		end
-		if mode ~= "read" and mode ~= "list" then done(true, nil); return end
+		if mode ~= "read" and mode ~= "list" and not structured then done(true, nil); return end
 		if mode == "read" and runtime.trim(raw.stdout) == "null" then done(nil, nil); return end
 		local decoded, decodeError = runtime.decode(raw.stdout)
 		done(decoded, decodeError)
 	end)
+end
+
+function data.createIssue(repo: Repo, identity: Identity, slot: number, draft: any, title: string, body: string,
+	labelIds: {string}?, done: (string?) -> ())
+	local scope = identityScope(repo, identity)
+	if not scope then done("storage_error"); return end
+	local stdin = tern.json.encode({host=repo.host, owner=repo.owner, name=repo.name, identity=identity,
+		slot=slot, draft=draft, title=title, body=body, labelIds=labelIds})
+	runtime.exec({"/usr/bin/ruby", tern.plugin.dir .. "/issue-create.rb", tern.plugin.data, scope},
+		{stdin=stdin, cwd="/", timeout_ms=45000, env={RUBYOPT="", RUBYLIB="", BUNDLE_GEMFILE="", GEM_HOME="", GEM_PATH=""}},
+		function(raw)
+			done(if raw and raw.status == 0 then runtime.trim(raw.stdout) else nil)
+		end)
 end
 
 return data

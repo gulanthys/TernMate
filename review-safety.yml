@@ -1,0 +1,16 @@
+# Review uses dedicated tools, not OMP's workspace discovery or agent modes.
+autoResume: false
+git:
+  enabled: false
+tools:
+  xdev: false
+goal:
+  enabled: false
+advisor:
+  enabled: false
+memory:
+  backend: 'off'
+mcp:
+  enableProjectConfig: false
+  evalNamespaces: false
+  notifications: false

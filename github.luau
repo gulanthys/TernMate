@@ -5,9 +5,9 @@ type Repo = runtime.Repo
 type Exec = runtime.Exec
 export type Filters = { [string]: string }
 export type Row = {
-	number: number, title: string, state: string, updated: string, author: string, url: string,
+	number: number, title: string, state: string, author: string, url: string,
 	draft: boolean, base: string?, requested: boolean, threads: boolean, ci: string,
-	mergeable: string?,
+	mergeable: string?, review: string?,
 }
 
 local github = {}
@@ -174,16 +174,15 @@ function github.project(snapshot: any, kind: string, filters: Filters): ({ Row }
 		end
 		if unknown then uncertain += 1; continue end
 		local row: Row = {
-			number = item.number, title = item.title, state = item.state, updated = item.updatedAt,
+			number = item.number, title = item.title, state = item.state,
 			author = login, url = item.url, draft = draft, base = item.baseRefName,
 			requested = requested == true, threads = threads == true, ci = ci,
-			mergeable = mergeable,
+			mergeable = mergeable, review = if pr and type(item.reviewDecision) == "string" then item.reviewDecision else nil,
 		}
 		table.insert(rows, row)
 	end
 	table.sort(rows, function(a, b)
-		if a.updated == b.updated then return a.number > b.number end
-		return a.updated > b.updated
+		return a.number > b.number
 	end)
 	return rows, uncertain
 end

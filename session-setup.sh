@@ -66,7 +66,7 @@ case "$1" in
         actual=$(physical "$2") && expected=$(physical "$3") && [ "$actual" = "$expected" ]
         ;;
     allocate)
-        root=$2/task-sessions-v1
+        root=$2/task-sessions-v2
         if ! mkdir -m 700 "$root" 2>/dev/null; then
             private_dir "$root" || fail '不能创建安全的任务存储目录。'
         fi
@@ -79,8 +79,65 @@ case "$1" in
         private_dir "$2" && [ ! -e "$2/materials.md" ] && [ ! -L "$2/materials.md" ] || fail '不能写入私有任务材料。'
         cat > "$2/materials.md"
         ;;
+    pr-prompt)
+        task=$2 program=$3 checkout=$4
+        private_dir "$task" && exe "$program" || fail '不能准备可信 PR 提示。'
+        agent=$(cd / && "$program" config path) || fail '无法确定 OMP 的全局配置目录。'
+        case "$agent" in /*) ;; *) fail 'OMP 全局配置路径不是绝对路径。';; esac
+        case "$agent" in *[[:cntrl:]]*) fail 'OMP 全局配置路径无效。';; esac
+        dest=$task/system-prompt.md
+        [ ! -L "$dest" ] && { [ ! -e "$dest" ] || regular "$dest"; } || fail '私有 PR 提示路径已被替换。'
+        temp=$(mktemp "$task/.system-prompt.XXXXXXXXXX")
+        trap 'rm -f -- "$temp"' EXIT
+        {
+            rules=$agent/RULES.md
+            if [ -e "$rules" ] || [ -L "$rules" ]; then
+                agent=$(physical "$agent") || fail '不能核对 OMP 全局配置路径。'
+                case "$agent/" in "$checkout/"*|"${task%/*}/"*) fail '不能从 checkout 或任务工作区加载规则。';; esac
+                regular "$agent/RULES.md" || fail 'OMP 全局 RULES.md 必须是普通文件。'
+                cat "$agent/RULES.md"
+                printf '\n\n'
+            fi
+            # The fixed task boundary comes last; global guidance is not authorization.
+            cat
+        } > "$temp"
+        mv -f -- "$temp" "$dest"
+        ;;
+    issue-head)
+        safe_git -C "$2" rev-parse --verify 'HEAD^{commit}'
+        ;;
+    prepare-issue)
+        task=$2 checkout=$3 number=$4
+        head=$5
+        safe_git -C "$checkout" rev-parse --verify "$head^{commit}" >/dev/null || exit 3
+        # A linked worktree inherits repository config. Do not run a
+        # repo-local checkout filter on a read-only Issue activation.
+        if safe_git -C "$checkout" config --get-regexp '^filter\..*\.(process|smudge)$' . >/dev/null; then
+            exit 4
+        else
+            [ "$?" -eq 1 ] || fail '无法核对 checkout 的 Git filter 配置。'
+        fi
+        safe_git -C "$checkout" -c submodule.recurse=false worktree add --no-track \
+            -b "ternmate/issue-$number-${task##*.}" -- "$task/worktree" "$head" >&2
+        ;;
+    check-issue)
+        task=$2 checkout=$3
+        wt=$task/worktree
+        private_dir "$task" && private_dir "$wt" && regular "$wt/.git" || exit 1
+        common=$(safe_git -C "$checkout" rev-parse --path-format=absolute --git-common-dir)
+        admin=$(safe_git -C "$wt" rev-parse --absolute-git-dir)
+        case "$admin" in "$common"/worktrees/*) ;; *) exit 1 ;; esac
+        [ "$(safe_git -C "$wt" rev-parse --path-format=absolute --git-common-dir)" = "$common" ] \
+            && [ "$(safe_git -C "$wt" rev-parse --show-toplevel)" = "$wt" ] \
+            && regular "$admin/gitdir" && [ "$(cat "$admin/gitdir")" = "$wt/.git" ] \
+            && safe_git -C "$wt" rev-parse --verify 'HEAD^{commit}' >/dev/null
+        ;;
     prepare)
-        task=$2 url=$3 ref=$4 expected=$5
+        task=$2 url=$3 ref=$4 expected=$5 number=$6 review_base=${7:-} review_ref=${8:-}
+        if [ -n "$review_base" ] || [ -n "$review_ref" ]; then
+            [ -n "$review_base" ] && safe_git check-ref-format "refs/heads/$review_ref" >/dev/null \
+                || fail '审核用的 PR base SHA 或分支无效。'
+        fi
         cd -P "$task"
         safe_git init -q --bare --template= store.git
         cp store.git/config initial-git-config
@@ -94,13 +151,40 @@ case "$1" in
         fi
         fetched=$(safe_git --git-dir=store.git rev-parse --verify 'FETCH_HEAD^{commit}')
         if [ "$fetched" != "$expected" ]; then printf '%s\n' "$fetched"; exit 3; fi
-        safe_git --git-dir=store.git worktree add --detach -- "$task/worktree" "$expected" >&2
+        safe_git --git-dir=store.git worktree add -b "ternmate/pr-$number-${task##*.}" -- "$task/worktree" "$expected" >&2
         actual=$(safe_git -C worktree rev-parse --verify 'HEAD^{commit}')
         [ "$actual" = "$expected" ] || fail '新 worktree 的 HEAD 不等于已验证的 PR 提交。'
         # Retain the original PR commit even after local commits change HEAD.
         safe_git --git-dir=store.git update-ref refs/ternmate/initial "$expected"
+        if [ -n "$review_base" ]; then
+            if ! safe_git --git-dir=store.git cat-file -e "$review_base^{commit}" 2>/dev/null; then
+                safe_git --git-dir=store.git -c http.followRedirects=false -c credential.helper= \
+                    -c 'credential.helper=!gh auth git-credential' -c fetch.fsckObjects=true \
+                    fetch -q --no-tags --no-recurse-submodules -- "$url" "$review_base" 2>/dev/null \
+                    || fail '无法获取审核用的 PR base 提交。'
+            fi
+            safe_git --git-dir=store.git update-ref refs/ternmate/review-base "$review_base"
+            base=$(safe_git --git-dir=store.git merge-base "$review_base" "$expected") \
+                || fail '无法核对 PR 的共同祖先。'
+            # Bound the private evidence file without confusing an empty diff with a Git failure.
+            limit=524288
+            if ! {
+                if safe_git --git-dir=store.git diff --no-ext-diff --no-textconv --no-color "$base" "$expected" --; then
+                    : > .review-diff-ok
+                fi
+            } | (head -c "$limit" && cat >/dev/null) > review.diff; then
+                fail '无法写入固定版本的 PR 差异。'
+            fi
+            [ -f .review-diff-ok ] || fail '无法生成固定版本的 PR 差异。'
+            if [ "$(wc -c < review.diff)" -ge "$limit" ]; then
+                printf '\n[Diff size limit reached. Evidence may be truncated.]\n' >> review.diff
+            fi
+            rm -f -- .review-diff-ok
+            diff_oid=$(safe_git --git-dir=store.git hash-object --no-filters -- review.diff)
+            printf '%s\n%s\n' "$review_ref" "$diff_oid" > review-evidence
+        fi
         ;;
-    check|push-source)
+    check|check-review|push-source)
         task=$2 expected=$3
         wt=$task/worktree
         admin=$task/store.git/worktrees/worktree
@@ -119,6 +203,15 @@ case "$1" in
             printf '%s\n' "$head"
             exit
         fi
+        if [ "$1" = check-review ]; then
+            review_base=$4 review_ref=$5
+            [ "$head" = "$expected" ] && regular "$task/review.diff" && regular "$task/review-evidence" \
+                && [ "$(safe_git -C "$wt" rev-parse --verify 'refs/ternmate/review-base^{commit}')" = "$review_base" ] \
+                || fail '审核的 head、base SHA 或差异已变化。'
+            diff_oid=$(safe_git -C "$wt" hash-object --no-filters -- "$task/review.diff")
+            [ "$(cat "$task/review-evidence")" = "$(printf '%s\n%s\n' "$review_ref" "$diff_oid")" ] \
+                || fail '审核的 base 分支或差异内容已变化。'
+        fi
         printf '%s\n' "$head"
         # Checking status can run a clean filter. Never do so if a user has
         # modified the fresh repository's configuration or added worktree config.
@@ -134,6 +227,13 @@ case "$1" in
     file)
         private_dir "$2" && regular "$3" && [ -s "$3" ] || exit 1
         LC_ALL=C head -c 16384 "$3" | head -n 2
+        ;;
+    session-empty)
+        private_dir "${2%/*}" && private_dir "$2" || fail '私有会话目录已失效。'
+        # Unlike discover, count even hidden, empty, malformed or non-regular entries.
+        # A failed listing must never be mistaken for an empty directory.
+        entries=$(CDPATH= cd -P "$2" && find . ! -name . -prune -print) || fail '无法读取私有会话目录。'
+        [ -z "$entries" ] || exit 3
         ;;
     discover)
         private_dir "$2" || fail '私有会话目录已失效。'

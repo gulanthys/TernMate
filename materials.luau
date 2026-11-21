@@ -5,6 +5,8 @@ local materials = {}
 
 type Kind = "issue" | "pr"
 export type TaskIdentity = { host: string, owner: string, name: string, kind: Kind, number: number, id: string }
+export type Identity = { repoId: string, viewerId: string }
+export type PRRevision = { head: string, baseRef: string?, baseSHA: string? }
 type Callback = (any, Problem?) -> ()
 type Problem = { kind: string, message: string }
 type Version = {
@@ -28,10 +30,11 @@ local VERSION_FIELDS = [[
 	potentialMergeCommit { oid parents(first: 2) { totalCount nodes { oid } } }
 ]]
 
-local ISSUE = "query(" .. TASK_VARS .. ") { repository(owner: $owner, name: $name) { nameWithOwner issue(number: $number) { " .. TASK_FIELDS .. " } } }"
-local PR = "query(" .. TASK_VARS .. ") { repository(owner: $owner, name: $name) { nameWithOwner pullRequest(number: $number) { " .. TASK_FIELDS .. VERSION_FIELDS .. " mergeable reviewDecision } } }"
-local HEAD = "query(" .. TASK_VARS .. ") { repository(owner: $owner, name: $name) { nameWithOwner pullRequest(number: $number) { __typename id number url headRefOid } } }"
-local PUSH_TARGET = "query(" .. TASK_VARS .. ") { repository(owner: $owner, name: $name) { nameWithOwner pullRequest(number: $number) { __typename id number url state headRefOid headRefName headRepository { nameWithOwner } } } }"
+local TASK_QUERY = "query(" .. TASK_VARS .. ") { viewer { id } repository(owner: $owner, name: $name) { id nameWithOwner "
+local ISSUE = TASK_QUERY .. "issue(number: $number) { " .. TASK_FIELDS .. " } } }"
+local PR = TASK_QUERY .. "pullRequest(number: $number) { " .. TASK_FIELDS .. VERSION_FIELDS .. " mergeable reviewDecision } } }"
+local REVISION = TASK_QUERY .. "pullRequest(number: $number) { __typename id number url headRefOid baseRefOid baseRefName } } }"
+local PUSH_TARGET = TASK_QUERY .. "pullRequest(number: $number) { __typename id number url state headRefOid headRefName headRepository { nameWithOwner } } }"
 local DISCUSSION = "query($id: ID!, $cursor: String) { node(id: $id) { ... on Issue { id comments(first: 50, after: $cursor) { " .. PAGE .. " nodes { " .. COMMENT_FIELDS .. " } } } } }"
 local THREADS = "query($id: ID!, $cursor: String) { node(id: $id) { ... on PullRequest { id headRefOid reviewThreads(first: 100, after: $cursor) { " .. PAGE .. " nodes { id isResolved } } } } }"
 local OVERALL_REVIEWS = "query($id: ID!, $cursor: String) { node(id: $id) { ... on PullRequest { id headRefOid latestReviews(first: 50, after: $cursor) { " .. PAGE .. " nodes { id url author { login __typename } state submittedAt commit { oid } body } } } } }"
@@ -88,6 +91,13 @@ local function sha(value: any): string?
 		return value:lower()
 	end
 	return nil
+end
+
+local function revisionFor(task: any): PRRevision?
+	local head = sha(task.headRefOid)
+	if not head then return nil end
+	local baseRef = text(task.baseRefName)
+	return { head = head, baseSHA = sha(task.baseRefOid), baseRef = if baseRef and not baseRef:find("[%s%c]") then baseRef else nil }
 end
 
 local function idText(value: any): string?
@@ -204,6 +214,11 @@ local function withCursor(fields: { string }, cursor: string?): { string }
 	return fields
 end
 
+local function authorized(data: any, identity: Identity): boolean
+	return type(data) == "table" and type(data.repository) == "table" and data.repository.id == identity.repoId
+		and type(data.viewer) == "table" and data.viewer.id == identity.viewerId
+end
+
 local function actual(repo: runtime.Repo, kind: Kind, number: number, data: any): (TaskIdentity?, any)
 	local repository = data and data.repository
 	if type(repository) ~= "table" or not sameName(repository.nameWithOwner, repoName(repo)) then return nil, nil end
@@ -220,33 +235,38 @@ local function actual(repo: runtime.Repo, kind: Kind, number: number, data: any)
 	return { host = repo.host:lower(), owner = owner, name = name, kind = kind, number = task.number, id = id }, task
 end
 
-local function readHead(exec: runtime.Exec, repo: runtime.Repo, number: number, done: (string?, string?, string?) -> ())
+local function readRevision(exec: runtime.Exec, repo: runtime.Repo, account: Identity, number: number,
+	done: (PRRevision?, string?, string?) -> ())
 	if not validTarget(repo, number) then
 		done(nil, "PR 任务身份无效。", nil)
 		return
 	end
-	graphql(exec, repo, HEAD, taskFields(repo, number), function(data, err)
+	graphql(exec, repo, REVISION, taskFields(repo, number), function(data, err)
 		if err then done(nil, err.message, nil); return end
+		if not authorized(data, account) then done(nil, "仓库或登录账号已变化；请刷新任务列表。", nil); return end
 		local identity, task = actual(repo, "pr", number, data)
-		local revision = if identity then sha(task.headRefOid) else nil
+		local revision = if identity then revisionFor(task) else nil
 		if identity and revision then
 			done(revision, nil, identity.id)
 		else
-			done(nil, "无法核对目标 PR 和 head SHA。", nil)
+			done(nil, "无法核对目标 PR 和版本。", nil)
 		end
 	end)
 end
 
-function materials.head(exec: runtime.Exec, repo: runtime.Repo, number: number, done: (sha: string?, error: string?) -> ())
-	readHead(exec, repo, number, function(revision, err)
+function materials.revision(exec: runtime.Exec, repo: runtime.Repo, account: Identity, number: number,
+	done: (PRRevision?, string?) -> ())
+	readRevision(exec, repo, account, number, function(revision, err)
 		done(revision, err)
 	end)
 end
 
-function materials.pushTarget(exec: runtime.Exec, repo: runtime.Repo, number: number, done: (string?, string?, string?, string?) -> ())
+function materials.pushTarget(exec: runtime.Exec, repo: runtime.Repo, account: Identity, number: number,
+	done: (string?, string?, string?, string?) -> ())
 	if not validTarget(repo, number) then done(nil, nil, nil, "PR 身份无效。"); return end
 	graphql(exec, repo, PUSH_TARGET, taskFields(repo, number), function(data, err)
 		if err then done(nil, nil, nil, err.message); return end
+		if not authorized(data, account) then done(nil, nil, nil, "仓库或登录账号已变化；请刷新任务列表。"); return end
 		local identity, task = actual(repo, "pr", number, data)
 		if not identity or task.state ~= "OPEN" then done(nil, nil, nil, "只能为可核对的开放 PR 准备推送命令。"); return end
 		local revision = sha(task.headRefOid)
@@ -789,7 +809,8 @@ local function enrichFailures(exec: runtime.Exec, repo: runtime.Repo, v: Version
 	load(1)
 end
 
-function materials.collect(exec: runtime.Exec, repo: runtime.Repo, kind: string, number: number, alive: () -> boolean, done: (data: any, error: string?) -> ())
+function materials.collect(exec: runtime.Exec, repo: runtime.Repo, account: Identity, kind: string, number: number,
+	expected: PRRevision?, alive: () -> boolean, done: (data: any, error: string?) -> ())
 	if (kind ~= "issue" and kind ~= "pr") or not validTarget(repo, number) then
 		done(nil, "GitHub 任务身份无效。")
 		return
@@ -814,13 +835,14 @@ function materials.collect(exec: runtime.Exec, repo: runtime.Repo, kind: string,
 	end
 	graphql(activeExec, repo, if taskKind == "pr" then PR else ISSUE, taskFields(repo, number), function(data, err)
 		if err then finish(nil, err.message); return end
+		if not authorized(data, account) then finish(nil, "仓库或登录账号已变化；请刷新任务列表。"); return end
 		local identity, task = actual(repo, taskKind, number, data)
 		if not identity or type(task.title) ~= "string" or type(task.body) ~= "string" then
 			finish(nil, "无法核对 GitHub 任务身份或读取标题和正文。")
 			return
 		end
 		local material: any = {
-			identity = identity, url = sourceUrl(task.url), title = task.title, body = task.body,
+			identity = identity, account = account, url = sourceUrl(task.url), title = task.title, body = task.body,
 			author = task.author, createdAt = task.createdAt, updatedAt = task.updatedAt,
 		}
 		if taskKind == "issue" then
@@ -831,13 +853,18 @@ function materials.collect(exec: runtime.Exec, repo: runtime.Repo, kind: string,
 			end)
 			return
 		end
-		local head = sha(task.headRefOid)
-		if not head then finish(nil, "PR 没有可验证的 head SHA。"); return end
-		material.head = head
+		local revision = revisionFor(task)
+		if not revision then finish(nil, "PR 没有可验证的 head SHA。"); return end
+		local head = revision.head
+		if not expected or head ~= expected.head or (expected.baseSHA ~= nil
+			and (revision.baseSHA ~= expected.baseSHA or revision.baseRef ~= expected.baseRef)) then
+			finish(nil, "开始读取材料时 PR 已不再对应所选版本。"); return
+		end
+		material.head, material.baseRef, material.baseSHA = head, revision.baseRef, revision.baseSHA
 		local mergeable = task.mergeable
 		material.mergeability = {
 			status = if mergeable == "CONFLICTING" or mergeable == "MERGEABLE" then mergeable else "UNKNOWN",
-			head = head, base = sha(task.baseRefOid), baseRef = text(task.baseRefName),
+			head = head, base = revision.baseSHA, baseRef = revision.baseRef,
 		}
 		local version = versionFor(task, head)
 		overallReviews(activeExec, repo, identity.id, head, task.reviewDecision, function(overall, _reviewError)
@@ -848,10 +875,11 @@ function materials.collect(exec: runtime.Exec, repo: runtime.Repo, kind: string,
 				exactChecks(activeExec, repo, number, head, function(ci, checks)
 					material.ci = ci
 					enrichFailures(activeExec, repo, version, checks, ci, function()
-						readHead(activeExec, repo, number, function(current, headError, id)
-							if headError then finish(nil, "复核 PR 版本：" .. headError); return end
-							if current ~= head or id ~= identity.id then
-								finish(nil, "读取期间 PR head 已变化（" .. head .. " → " .. (current or "未知") .. "）；请刷新后重试。")
+						readRevision(activeExec, repo, account, number, function(current, versionError, id)
+							if versionError then finish(nil, "复核 PR 版本：" .. versionError); return end
+							if not current or current.head ~= head or id ~= identity.id
+								or (expected.baseSHA ~= nil and (current.baseSHA ~= revision.baseSHA or current.baseRef ~= revision.baseRef)) then
+								finish(nil, "读取材料期间 PR 版本已变化；未使用这些材料。")
 								return
 							end
 							finish(material, nil)
