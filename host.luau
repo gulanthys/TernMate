@@ -1036,8 +1036,8 @@ local function browseToolbar(state: State, kind: string, filters: Filters, busy:
 	end
 	table.insert(controls, button("自动清理历史", "history_open", nil,
 		busy or state.verifying or state.confirm ~= nil or not state.read))
-	local toolbar = wrapRow(controls, "toolbar")
-	return ui.node("col", { key = "controls", gap = "xs" }, { toolbar, wrapRow(chips, "conditions") })
+	for _, chip in chips do table.insert(controls, chip) end
+	return ui.node("col", { key = "controls" }, { wrapRow(controls, "toolbar") })
 end
 
 local function rowStatus(row: Row): string
