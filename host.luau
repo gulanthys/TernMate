@@ -48,7 +48,6 @@ type Preset = { title: string, filters: Filters }
 local ISSUE = "issue"
 local CLEANUP_PAGE = 4
 local PR = "pr"
-local PAGE = 20
 local EDIT_INPUT = "layer.editor.input"
 local WORKSPACE = "main.workspace"
 local RESULTS = WORKSPACE .. ".master.results"
@@ -756,8 +755,16 @@ local function editorKey(edit: Editor, key: Key): boolean
 end
 
 local function pageSize(state: State, cx: BlockCx): number
-	-- Reserve room for the header, filters, footer, and Issue details.
-	return math.clamp(math.floor((cx.rows - (if kindFor(state) == ISSUE then 16 else 13)) / 2), 1, PAGE)
+	-- Task rows are 24px in the native list, about 1.5 terminal rows.
+	local reserved = if kindFor(state) == ISSUE then 13 else 12
+	local scope, list = state.read, state.listing
+	if scope and (scope.error or scope.revisionError) then reserved += 2 end
+	if scope and scope.autoCleaned then reserved += 2 end
+	if list and list.data.uncertain > 0 then reserved += 2 end
+	if state.progress then reserved += 2 end
+	if state.taskError then reserved += 2 end
+	if state.confirm then reserved += 2 end
+	return math.max(1, math.floor((cx.rows - reserved) / 1.5))
 end
 
 local function pageAt(list: Listing, size: number): number
@@ -1168,10 +1175,6 @@ local function listView(state: State, cx: BlockCx, repo: Repo, kind: string, fil
 	end
 	table.insert(master, ui.node("list", { key = "results", selected = RESULTS .. ".n" .. selected.number,
 		filter = filters.title }, rows))
-	if kind == ISSUE then
-		table.insert(master, issueDetails(state, selected, links and links[selected.number],
-			if localBadge then localBadge(selected.number) else nil, current))
-	end
 
 	return column()
 end
@@ -1249,10 +1252,18 @@ local function view(state: State, cx: BlockCx): BlockView
 			ui.button("›", { key = "next", title = "下一页", size = "sm", disabled = busy or page * size >= total,
 				actions = { click = "page=" .. (page + 1) } }),
 		})
-		table.insert(dock, ui.node("row", { key = "pager", justify = "end", gap = "sm", wrap = true }, {
-			controls,
-			text((if complete then "共 " else "已找到 ") .. total .. " 项"),
+		local footer: { Node } = {}
+		if kind == ISSUE then
+			local selected = list.data.rows[list.position]
+			local badge = if scope and state.saved.checkout then sessions.issueBadges(repo, scope.identity, state.saved.checkout) else nil
+			table.insert(footer, issueDetails(state, selected, scope and scope.links and scope.links[selected.number],
+				if badge then badge(selected.number) else nil, current))
+		end
+		table.insert(footer, ui.node("row", { key = "page_controls", gap = "sm" }, {
+			controls, text((if complete then "共 " else "已找到 ") .. total .. " 项"),
 		}))
+		table.insert(dock, ui.node("row", { key = "pager", justify = if kind == ISSUE then "between" else "end",
+			gap = "sm", wrap = true }, footer))
 	end
 	if not state.confirm and not busy then
 		local spans = { ui.span("↑ ↓", "key"), ui.span(" 选择   ", "muted"),
@@ -1273,7 +1284,7 @@ local function view(state: State, cx: BlockCx): BlockView
 	elseif not layer then
 		if state.filtersOpen then layer = filtersView(state, kind, filters) end
 	end
-	return { main = ui.col(main), dock = ui.col(dock), layer = layer }
+	return { main = ui.node("col", { gap = "xs" }, main), dock = ui.col(dock), layer = layer }
 end
 
 local block: BlockDef<State> = {
