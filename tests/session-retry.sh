@@ -23,6 +23,22 @@ probe() {
     fi
     printf '%s = %s,\n' "$1" "$status"
 }
+
+mkdir -m 700 "$tmp/new-material" "$tmp/old-material"
+helper="$src/session-setup.sh"
+printf '%s\n' '{"conversation:escaped\\id":true}' '# New material' |
+    /bin/sh "$helper" material "$tmp/new-material" baseline
+printf '%s\n' '# New material' > "$tmp/expected"
+cmp "$tmp/expected" "$tmp/new-material/materials.md"
+/bin/sh "$helper" comment-state "$tmp/new-material" > "$tmp/actual"
+printf 'baseline\n%s' '{"conversation:escaped\\id":true}' > "$tmp/expected"
+cmp "$tmp/expected" "$tmp/actual"
+printf '%s\n' '# Legacy material' | /bin/sh "$helper" material "$tmp/old-material"
+printf '%s\n' '{}' | /bin/sh "$helper" comment-queue "$tmp/old-material"
+/bin/sh "$helper" comment-state "$tmp/old-material" initial > "$tmp/actual"
+printf 'initial\n# Legacy material\n' > "$tmp/expected"
+cmp "$tmp/expected" "$tmp/actual"
+
 {
     printf '%s\n' 'local directoryStatus = {'
     probe empty 0
@@ -53,14 +69,86 @@ local function copy(value)
 	return out
 end
 local decoded = {}
+local escapes = { ['\\'] = '\\', ['"'] = '"', n = '\n', r = '\r', t = '\t' }
 local function encode(value)
-	if #value == 0 then return '{}' end
-	return '["' .. table.concat(value, '","') .. '"]'
+	local kind = type(value)
+	if kind == 'string' then
+		local escaped = value:gsub('[\\"\n\r\t]', function(ch)
+			for code, original in pairs(escapes) do
+				if original == ch then return '\\' .. code end
+			end
+			error('unexpected escape')
+		end)
+		return '"' .. escaped .. '"'
+	end
+	if kind ~= 'table' then return tostring(value) end
+	local parts = {}
+	if #value > 0 then
+		for _, item in ipairs(value) do table.insert(parts, encode(item)) end
+		return '[' .. table.concat(parts, ',') .. ']'
+	end
+	for key, item in pairs(value) do table.insert(parts, encode(key) .. ':' .. encode(item)) end
+	table.sort(parts)
+	local result = '{' .. table.concat(parts, ',') .. '}'
+	if value.serial then decoded[result] = copy(value) end
+	return result
+end
+local function decode(text)
+	if decoded[text] then return copy(decoded[text]) end
+	local pos = 1
+	local function char()
+		pos = text:match('^%s*()', pos)
+		return text:sub(pos, pos)
+	end
+	local function read()
+		local ch = char()
+		pos += 1
+		if ch == '"' then
+			local parts = {}
+			while true do
+				local stop = assert(text:find('[\\"]', pos))
+				table.insert(parts, text:sub(pos, stop - 1))
+				pos = stop + 1
+				if text:sub(stop, stop) == '"' then return table.concat(parts) end
+				table.insert(parts, assert(escapes[text:sub(pos, pos)]))
+				pos += 1
+			end
+		end
+		if ch == '[' or ch == '{' then
+			local out = {}
+			local close = if ch == '[' then ']' else '}'
+			if char() ~= close then
+				while true do
+					if ch == '[' then table.insert(out, read())
+					else
+						local key = read()
+						assert(type(key) == 'string' and char() == ':')
+						pos += 1
+						out[key] = read()
+					end
+					if char() ~= ',' then break end
+					pos += 1
+				end
+			end
+			assert(char() == close)
+			pos += 1
+			return out
+		end
+		local token, after = text:match('^([%w.-]+)()', pos - 1)
+		assert(token)
+		pos = after
+		if token == 'true' then return true end
+		if token == 'false' then return false end
+		return assert(tonumber(token))
+	end
+	local value = read()
+	assert(char() == '')
+	return value
 end
 local tern = {
 	plugin = { dir = '/plugin', id = 'ternmate', data = data },
 	runtime = { os = 'linux' },
-	json = { encode = encode, decode = function(key) return copy(assert(decoded[key], key)) end },
+	json = { encode = encode, decode = decode },
 	kv = {
 		get = function(key) return copy(s.indices[key]) end,
 		set = function(key, value) s.indices[key] = copy(value) end,
@@ -73,7 +161,17 @@ local modules = {
 	['./maintenance_data'] = { identity = function(_, cb) cb(identity) end },
 	['./materials'] = {
 		revision = function(_, _, _, _, cb) cb(revision) end,
-		collect = function(_, _, _, _, _, _, _, cb) cb({ identity = identity, head = head }) end,
+		mergedHead = function(_, _, _, _, cb)
+			if s.merged then cb(s.remoteHead or head) else cb(nil, 'remote is not merged') end
+		end,
+		collect = function(_, _, _, _, _, _, _, cb)
+			cb({ identity = identity, head = head, discussion = { complete = true, comments = s.comments or {} },
+				overallReviews = { complete = true, reviews = s.reviews or {} }, reviewThreads = s.threads or {} })
+		end,
+		collectComments = function(_, _, _, _, _, _, cb)
+			cb({ discussion = { complete = true, comments = s.comments or {} },
+				overallReviews = { complete = true, reviews = s.reviews or {} }, reviewThreads = s.threads or {} })
+		end,
 	},
 }
 local function require(name) return assert(modules[name], name) end
@@ -105,7 +203,7 @@ local function view()
 	end
 	return { panes = panes, clients = { { kind = 'gui', window = '2' } }, sessions = { { id = 6, tabs = tabs } } }
 end
-local function exec(argv, _, cb)
+local function exec(argv, opts, cb)
 	local op = argv[2]
 	if argv[1] == '/bin/sh' then
 		assert(argv[2] == '/plugin/session-setup.sh')
@@ -114,8 +212,33 @@ local function exec(argv, _, cb)
 		elseif op == 'source' then cb(result(0, '/checkout\n' .. data .. '\n'))
 		elseif op == 'omp' then cb(result(0, program .. '\n'))
 		elseif op == 'allocate' then cb(result(0, task .. '\n'))
-		elseif op == 'material' or op == 'prepare' or op == 'pr-prompt' then cb(result(0))
-		elseif op == 'check-review' then cb(result(0, head .. '\nclean\n'))
+		elseif op == 'material' then
+			assert(argv[4] == task and argv[5] == 'baseline')
+			s.baseline, s.markdown = opts.stdin:match('^([^\n]+)\n(.*)$')
+			assert(s.baseline and s.markdown)
+			cb(result(0))
+		elseif op == 'prepare' or op == 'pr-prompt' then cb(result(0))
+		elseif op == 'check-review' then cb(if s.cleaned then result(6) else result(0, head .. '\nclean\n'))
+		elseif op == 'cleanup-pr-check' or op == 'cleanup-pr' then
+			assert(argv[4] == data and argv[5] == task and argv[6] == head and argv[7] == '7')
+			if op == 'cleanup-pr-check' then cb(result(if s.cleaned then 8 else 0))
+			else
+				assert(not s.cleaned, 'should never mutate an already cleaned workspace')
+				s.cleaned = true
+				cb(result(0))
+			end
+		elseif op == 'restore-pr' then
+			assert(s.cleaned and argv[4] == task and argv[5] == head and argv[6] == '7')
+			s.cleaned = false
+			cb(result(0))
+		elseif op == 'comment-state' then
+			if s.queued and argv[5] ~= 'initial' then
+				cb(result(0, tostring(s.receipt or 0) .. '\n' .. s.queued))
+			elseif s.legacy then cb(result(0, 'initial\n' .. s.legacy))
+			else cb(result(0, 'baseline\n' .. s.baseline)) end
+		elseif op == 'comment-queue' then
+			s.queued = opts.stdin
+			cb(result(0))
 		elseif op == 'discover' then cb(result(0, if s.directory == 'malformed' or s.directory == 'blank' or s.file then file .. '\n' else ''))
 		elseif op == 'file' then
 			assert(argv[5] == file)
@@ -283,6 +406,122 @@ assert(record().file == file and record().launchAttempt == nil)
 s.file = false
 waitOutLaunch(); activate(); phase('launching')
 assert(s.launches == 2)
+
+-- Live and resumed sessions submit the delta to the same conversation.
+reset({ pane = 'running', report = file }, { pane = 'running', report = file })
+s.comments = { { id = 'existing', body = 'first turn' } }
+assert(activate()); phase('opened')
+s.file = true
+s.comments = { { id = 'existing', body = 'first turn' }, { id = 'new', body = 'NEW_QUESTION' } }
+assert(activate():find('已排队', 1, true))
+local queued = s.queued
+local batch = decoded[queued].pending[1]
+assert(batch.session == file and batch.message:find('NEW_QUESTION', 1, true) and not batch.message:find('first turn', 1, true))
+local duplicateResult = assert(activate())
+assert(duplicateResult:find('没有其他新增评论', 1, true), duplicateResult)
+assert(s.queued == queued and s.launches == 1)
+s.panes[1].exited = 0
+s.receipt = 1
+table.insert(s.comments, { id = 'during-exit', body = 'QUESTION_WHILE_CLOSED' })
+assert(activate():find('已恢复', 1, true))
+local pending = decoded[s.queued].pending
+assert(s.launches == 2 and pending[1].session == file and #pending == 1)
+assert(pending[1].message:find('QUESTION_WHILE_CLOSED', 1, true) and not pending[1].message:find('NEW_QUESTION', 1, true))
+
+-- Bounded snapshots keep complete entries, and only those entries form the baseline.
+reset({ pane = 'running', report = file })
+local function longComment(id, size)
+	return { id = id, body = id .. ' \\"} [' .. string.rep('雪', size) }
+end
+s.comments = { longComment('old-conversation', 14000), longComment('omitted-conversation', 14000) }
+s.reviews = { longComment('old-review', 14000), longComment('omitted-review', 14000) }
+s.threads = { { id = 'thread', path = 'source.lua', comments = {
+	longComment('old-inline', 36000), longComment('omitted-inline', 18000),
+} } }
+assert(activate()); phase('opened')
+local sections, truncations = 0, 0
+for label, jsonText in s.markdown:gmatch('\n## ([^\n]+)\n\n```json\n(.-)\n```\n') do
+	if label ~= 'Task and source' then
+		local section = decode(jsonText)
+		local entries = section.comments or section.reviews or section[1].comments
+		assert(#entries == 1 and entries[1].id:find('^old%-'))
+		sections += 1
+	end
+end
+for _ in s.markdown:gmatch('remaining entries were omitted') do truncations += 1 end
+assert(sections == 3 and truncations == 3)
+local initial = decode(s.baseline)
+assert(initial['conversation:old-conversation'] and initial['review:old-review'] and initial['inline:old-inline'])
+assert(not initial['conversation:omitted-conversation'] and not initial['review:omitted-review'] and not initial['inline:omitted-inline'])
+s.file = true
+table.insert(s.comments, { id = 'new', body = 'NEW_AFTER_BOUNDED_SNAPSHOT' })
+assert(activate():find('已排队', 1, true))
+local boundedMessage = decoded[s.queued].pending[1].message
+for _, id in ipairs({ 'omitted-conversation', 'omitted-review', 'omitted-inline', 'NEW_AFTER_BOUNDED_SNAPSHOT' }) do
+	assert(boundedMessage:find(id, 1, true), id)
+end
+assert(not boundedMessage:find('old-', 1, true))
+assert(activate():find('没有其他新增评论', 1, true))
+
+-- Recover complete legacy Discussion entries, including from a truncated
+-- snapshot whose old queue already contains a separate outstanding batch.
+for _, truncated in ipairs({ false, true }) do
+	reset({ pane = 'running', report = file })
+	assert(activate()); phase('opened')
+	s.file = true
+	local shown = { id = 'legacy-shown', body = 'A "\\ bracket ] and brace } are not delimiters.' }
+	local unseen = { id = 'legacy-unseen', body = 'This comment was not shown.' }
+	s.comments = { shown, unseen }
+	local comments = '[' .. encode(shown)
+		.. (if truncated then ',{"id":"legacy-unseen","body":"This comment' else ']')
+	s.legacy = '\n## Discussion\n\n```json\n' .. comments .. '\n```\n'
+	if truncated then
+		s.threads = { { id = 'legacy-thread', comments = {
+			{ id = 'legacy-inline-shown', body = 'The complete inline reply.' },
+			{ id = 'legacy-inline-unseen', body = 'The incomplete inline reply.' },
+		} } }
+		s.legacy ..= '\n## Review threads\n\n```json\n[{"id":"legacy-thread","comments":['
+			.. encode(s.threads[1].comments[1]) .. ',{"id":"legacy-inline-unseen","body":"The inc\n```\n'
+		s.queued = encode({ serial = 1, seen = {}, pending = { { serial = 1, session = file, message = 'prior batch' } } })
+	end
+	assert(activate():find('已排队', 1, true))
+	local queuedState = decoded[s.queued]
+	local legacyMessage = queuedState.pending[if truncated then 2 else 1].message
+	assert(not legacyMessage:find(shown.id, 1, true) and legacyMessage:find(unseen.id, 1, true))
+	if truncated then
+		assert(queuedState.pending[1].message == 'prior batch')
+		assert(legacyMessage:find('legacy-inline-unseen', 1, true) and not legacyMessage:find('legacy-inline-shown', 1, true))
+	end
+end
+
+-- Confirmation must still refer to the same remote revision and an idle worktree.
+reset({ pane = 'running', report = file }, { pane = 'running', report = file })
+assert(activate())
+s.file = true
+local function preview()
+	local targets, err
+	sessions.cleanupPreview(exec, request, function(items, why) targets, err = items, why end)
+	return targets, err
+end
+local function clean(target)
+	local message, problem
+	sessions.cleanPR(exec, request, target, function(ok, why) message, problem = ok, why end)
+	return message, problem
+end
+assert(not preview(), 'local cache is not evidence of remote merge')
+s.merged = true
+assert(assert(preview())[1].problem, 'running conversation blocks cleanup')
+s.panes[1].exited = 0
+local target = assert(preview())[1]
+assert(not target.problem and target.review and target.dir == task)
+s.remoteHead = base
+assert(not clean(target) and not s.cleaned, 'head change after preview blocks cleanup')
+s.remoteHead = head
+table.insert(s.panes, { pane = 91, cwd = task .. '/worktree/a', program = '/bin/sh' })
+assert(not clean(target) and not s.cleaned, 'a shell using the worktree after preview blocks cleanup')
+s.panes[2].exited = 0
+assert(clean(target) and s.cleaned and not preview())
+assert(activate():find('已恢复', 1, true) and not s.cleaned and s.launches == 2)
 print('Session retry lifecycle and physical emptiness checks passed.')
 LUAU
 } > "$tmp/retry.luau"

@@ -36,10 +36,16 @@ local missing = 'issues:removed'
 local function connection(nodes, cursor, total)
 	return { nodes = nodes, totalCount = total or #nodes, pageInfo = { hasNextPage = cursor ~= nil, endCursor = cursor } }
 end
+local linkedIssue = 50
+local function linked(number, state, cross)
+	return { id = 'linked:' .. number, number = number, state = state, isDraft = false,
+		repository = if cross then {id = 'another-repo', nameWithOwner = 'other/repo'} else {id = identity.repoId, nameWithOwner = 'owner/repo'} }
+end
 local function item(kind, number, old, detail)
 	local changed = number == 1 or number == last
 	local prefix = if old or not changed then 'prior ' else 'remote '
 	local row = { id = kind .. ':' .. number, number = number, updatedAt = prefix .. number, state = 'CLOSED' }
+	if kind == 'issues' and number == linkedIssue then row.state = 'OPEN' end
 	if kind == 'prs' then
 		row.headRefOid, row.baseRefName, row.isDraft = 'head', 'main', false
 	end
@@ -50,6 +56,9 @@ local function item(kind, number, old, detail)
 			if old then nil else 'labels', if old then 1 else 2) else connection({})
 		if kind == 'issues' then
 			row.assignees = connection({})
+			row.closedByPullRequestsReferences = if number == linkedIssue then connection({ linked(7, if old then 'OPEN' else 'MERGED', true) })
+				elseif number == last then connection({ linked(8, 'OPEN') }, if old then nil else 'links', if old then 1 else 2)
+				else connection({})
 		else
 			row.isCrossRepository, row.mergeable, row.commits = false, 'MERGEABLE', { nodes = {} }
 			row.closingIssuesReferences, row.reviewThreads = connection({}), connection({})
@@ -105,12 +114,18 @@ local function scenario(stillExists, revised)
 		local detail = query:match('%stitle%s+url%s') ~= nil
 		if vars.id then
 			local kind, number = vars.id:match('^(%a+):(%d+)$')
-			assert(tonumber(number) == last and vars.cursor == 'labels' and query:find('labels', 1, true))
+			assert(tonumber(number) == last)
 			assert(visible[kind][vars.id].title == 'prior ' .. vars.id, 'published before nested verification')
-			scan[kind].expanded = true
 			payload.node = item(kind, last, false, false)
 			payload.node.repository = { id = identity.repoId }
-			payload.node.labels = connection({ { id = 'second', name = 'second' } }, nil, 2)
+			if vars.cursor == 'links' then
+				assert(kind == 'issues' and query:find('includeClosedPrs:true', 1, true))
+				payload.node.closedByPullRequestsReferences = connection({ linked(9, 'CLOSED') }, nil, 2)
+			else
+				assert(vars.cursor == 'labels' and query:find('labels', 1, true))
+				scan[kind].expanded = true
+				payload.node.labels = connection({ { id = 'second', name = 'second' } }, nil, 2)
+			end
 		elseif vars.ids then
 			payload.nodes = {}
 			for _, id in vars.ids do
@@ -120,7 +135,7 @@ local function scenario(stillExists, revised)
 					table.insert(payload.nodes, if stillExists then { id = missing, repository = { id = identity.repoId } } else tern.json.null)
 				else
 					local kind, number = id:match('^(%a+):(%d+)$')
-					local row = item(kind, assert(tonumber(number), id), false, detail)
+					local row = item(kind, assert(tonumber(number), id), false, detail or query:find('closedByPullRequestsReferences', 1, true) ~= nil)
 					row.repository = { id = identity.repoId }
 					table.insert(payload.nodes, row)
 				end
@@ -187,6 +202,12 @@ local function scenario(stillExists, revised)
 				visible.issues[reverted] = row
 				continue
 			end
+			if kind == 'issues' and row.number == linkedIssue then
+				assert(row.state == 'OPEN' and row.updatedAt == visible.issues[row.id].updatedAt)
+				assert(row.closedByPullRequestsReferences.nodes[1].state == 'MERGED')
+				visible.issues[row.id] = row
+				continue
+			end
 			assert(row.title == 'remote ' .. row.id)
 			local state = scan[kind]
 			if row.number == last then
@@ -220,6 +241,10 @@ local function scenario(stillExists, revised)
 			assert(byId(result[kind], kind .. ':1').title == 'remote ' .. kind .. ':1')
 			assert(byId(saved[kind], kind .. ':' .. last).labels.nodes[2].name == 'second')
 		end
+		local associated = byId(saved.issues, 'issues:' .. linkedIssue)
+		assert(associated.closedByPullRequestsReferences.nodes[1].repository.nameWithOwner == 'other/repo')
+		assert(associated.closedByPullRequestsReferences.nodes[1].state == 'MERGED')
+		assert(byId(saved.issues, 'issues:' .. last).closedByPullRequestsReferences.nodes[2].state == 'CLOSED')
 		assert(not byId(result.issues, missing) and not byId(saved.issues, missing))
 	end
 end

@@ -5,7 +5,7 @@ type Repo = runtime.Repo
 type Callback = (any, string?) -> ()
 type SyncCallback = (any, string?, boolean?, boolean?) -> ()
 type Progress = ("issues" | "prs", {any}) -> ()
-type Nested = {name: string, first: number, fields: string, detail: string?}
+type Nested = {name: string, first: number, fields: string, detail: string?, args: string?}
 type Kind = {name: string, typename: string, scalars: string, keys: {string}, nested: {Nested}}
 export type Identity = {
 	repoId: string, viewerId: string, viewer: string, visibility: string, hasIssues: boolean,
@@ -20,11 +20,13 @@ local paging = "pageInfo{hasNextPage endCursor}"
 local index = "id number updatedAt state"
 local prIndex = "headRefOid baseRefName isDraft reviewDecision"
 local issue: Kind = {
-	name = "issues", typename = "Issue", scalars = "milestone{id title url}",
-	keys = {"milestone"},
+	name = "issues", typename = "Issue", scalars = "stateReason milestone{id title url}",
+	keys = {"milestone", "stateReason"},
 	nested = {
 		{name = "labels", first = 30, fields = "id name"},
 		{name = "assignees", first = 15, fields = "id login"},
+		{name = "closedByPullRequestsReferences", first = 10, args = ",includeClosedPrs:true",
+			fields = "id number state isDraft repository{id nameWithOwner}"},
 	},
 }
 local pr: Kind = {
@@ -42,7 +44,7 @@ local pr: Kind = {
 }
 
 local function nestedFields(spec: Nested, detail: boolean, after: boolean): string
-	return spec.name .. (if after then "(first:50,after:$cursor)" else "(first:" .. spec.first .. ")")
+	return spec.name .. (if after then "(first:50,after:$cursor" else "(first:" .. spec.first) .. (spec.args or "") .. ")"
 		.. "{totalCount " .. paging .. " nodes{" .. spec.fields
 		.. (if detail and spec.detail then " " .. spec.detail else "") .. "}}"
 end
@@ -168,6 +170,11 @@ local function childShape(spec: Nested, value: any, detail: boolean): boolean
 	if not itemId(value) then return false end
 	if spec.name == "labels" then return type(value.name) == "string" end
 	if spec.name == "assignees" then return type(value.login) == "string" end
+	if spec.name == "closedByPullRequestsReferences" then
+		return type(value.number) == "number" and value.number > 0 and value.number % 1 == 0
+			and (value.state == "OPEN" or value.state == "MERGED" or value.state == "CLOSED")
+			and type(value.isDraft) == "boolean" and itemId(value.repository) and type(value.repository.nameWithOwner) == "string"
+	end
 	if spec.name == "closingIssuesReferences" then return type(value.number) == "number" and type(value.url) == "string" end
 	if spec.name == "reviewThreads" then return type(value.isResolved) == "boolean" end
 	if spec.name == "latestReviews" then return type(value.state) == "string" and (not detail or type(value.url) == "string") end
@@ -198,6 +205,8 @@ local function indexItems(kind: Kind, items: any): {[string]: any}?
 		end
 		for _, spec in kind.nested do
 			local value = item[spec.name]
+			-- Legacy caches are still browseable; the next scan hydrates this evidence.
+			if spec.name == "closedByPullRequestsReferences" and value == nil then continue end
 			if not connection(value) or value.pageInfo.hasNextPage or #value.nodes ~= value.totalCount then return nil end
 			if not acceptChildren(spec, value.nodes, true, {}) then return nil end
 		end
@@ -258,7 +267,8 @@ function data.cached(repo: Repo, identity: Identity, done: Callback)
 		end
 		if not sameScope(repo, identity, value) then done(nil, "本地镜像不完整或身份不符。"); return end
 		if value.repoUrl ~= identity.webUrl then done(nil, nil); return end
-		if not indexItems(issue, value.issues) or not indexItems(pr, value.prs) then
+		local cachedIssues = indexItems(issue, value.issues)
+		if not cachedIssues or not indexItems(pr, value.prs) then
 			done(nil, "本地镜像不完整。"); return
 		end
 		value.viewer = identity.viewer -- Login can change; the cache key cannot.
@@ -278,6 +288,9 @@ function data.cached(repo: Repo, identity: Identity, done: Callback)
 		end
 		value.resultRevision = confirmed
 		if confirmed ~= revision then value.checkedEpoch = nil end
+		for _, item in cachedIssues do
+			if not item.closedByPullRequestsReferences then value.checkedEpoch = nil; break end
+		end
 		done(value, nil)
 	end)
 end
@@ -514,7 +527,7 @@ local function syncScope(repo: Repo, identity: Identity, scope: string, revision
 				.. " nodes(ids:$ids){... on " .. kind.typename .. "{repository{id} " .. selection .. "}}}"
 		end
 		local detailQuery = if warm then nodeQuery(detailFields) else ""
-		local openProbeQuery = if warm and kind == pr then nodeQuery(fields(kind, false)) else ""
+		local openProbeQuery = if warm then nodeQuery(fields(kind, false)) else ""
 		local function resolve(inventory: {any}, detail: boolean, complete: ({any}) -> ())
 			if detail then
 				expand(kind, inventory, true, function()
@@ -528,11 +541,12 @@ local function syncScope(repo: Repo, identity: Identity, scope: string, revision
 			local open: {number} = {}
 			for position, entry in inventory do
 				local prior = old and old[entry.id]
-				if not prior or not sameIndex(entry, prior) or (lastVisible and visible and visible[entry.id] ~= prior) then
+				if not prior or not sameIndex(entry, prior) or (kind == issue and not prior.closedByPullRequestsReferences)
+					or (lastVisible and visible and visible[entry.id] ~= prior) then
 					table.insert(changed, position)
 				else
 					items[position] = prior
-					if kind == pr and entry.state == "OPEN" then table.insert(open, position) end
+					if entry.state == "OPEN" then table.insert(open, position) end
 				end
 			end
 			local function load(positions: {number}, detail: boolean, use: (number, any) -> (), ready: () -> ())

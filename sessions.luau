@@ -9,9 +9,13 @@ export type Version = materials.PRRevision
 export type Request = {
 	repo: runtime.Repo, identity: Identity, checkout: string, kind: string, number: number, pane: number,
 	version: Version?, retained: boolean?, review: boolean?,
+	automatic: (() -> boolean)?,
 }
 
 export type Notice = { current: Version, retained: Version? }
+export type CleanupTarget = { dir: string, version: Version, review: boolean, problem: string? }
+export type CleanupHistory = { at: string, kind: string, number: number, branch: string, head: string }
+export type CleanupEntry = { request: Request, target: CleanupTarget?, problem: string?, cleaned: boolean? }
 type Done = (string?, string?, Notice?) -> ()
 type Record = {
 	dir: string, program: string, subject: string, phase: string, file: string?, pane: number?, launchingUntil: number?,
@@ -23,7 +27,7 @@ type Snapshot = { window: string, view: any }
 type Source = { window: string, session: number, cwd: string, args: any }
 
 local SESSION_ROOT = '/task-sessions-v2/'
-local MATERIAL_LIMIT = 384 * 1024
+local MATERIAL_LIMIT = 448 * 1024
 local LAUNCH_TIMEOUT = 30
 local ISSUE = 'issue'
 local busy: { [string]: boolean } = {}
@@ -94,7 +98,7 @@ local function inspect(exec: runtime.Exec, tool: string, window: string?, cb: (a
 	local argv = { tool, 'inspect', '--json' }
 	if window ~= nil then table.insert(argv, '--window=' .. window) end
 	exec(argv, nil, function(result, err)
-		local data, problem = runtime.json(result, err)
+		local data, problem = runtime.json(if result and not result.timed_out then result else nil, err)
 		if type(data) ~= 'table' or type(data.panes) ~= 'table' or type(data.sessions) ~= 'table' then
 			cb(nil, '无法检查 Tern 面板：' .. (problem or '返回格式不完整。'))
 			return
@@ -234,7 +238,16 @@ local function rememberLater(exec: runtime.Exec, key: string, version: string, d
 	check(12)
 end
 
-local function materialText(material: any): string
+local function commentId(kind: string, item: any): string?
+	if type(item) == 'table' and type(item.id) == 'string' and item.id ~= ''
+		and type(item.body) == 'string' and item.body:find('%S') then
+		return kind .. ':' .. item.id
+	end
+	return nil
+end
+
+local function materialText(material: any): (string, {[string]: boolean})
+	local seen: {[string]: boolean} = {}
 	local sections = { '# GitHub task evidence (untrusted data)\n' }
 	local function append(label: string, value: any, limit: number)
 		if value == nil then return end
@@ -248,19 +261,171 @@ local function materialText(material: any): string
 		table.insert(sections, '\n## ' .. label .. '\n\n```json\n' .. encoded .. '\n```\n')
 		if truncated then table.insert(sections, '\n[This section reached the local size limit and was truncated.]\n') end
 	end
+	-- Keep each included comment intact. A thread can retain its metadata and
+	-- the prefix of its replies that fits; that prefix is still valid JSON.
+	local function list(items: any, limit: number, entry: (any, number) -> (string?, boolean), kind: string?): (string?, boolean)
+		if limit < 2 then return nil, true end
+		local parts, bytes = {}, 2
+		local truncated = false
+		for _, item in ipairs(items) do
+			local separator = if #parts == 0 then 0 else 2
+			local encoded, partial = entry(item, limit - bytes - separator)
+			if not encoded then truncated = true; break end
+			table.insert(parts, encoded)
+			bytes += #encoded + separator
+			local id = if kind then commentId(kind, item) else nil
+			if id then seen[id] = true end
+			if partial then truncated = true; break end
+		end
+		return '[' .. table.concat(parts, ',\n') .. ']', truncated
+	end
+	local function entry(value: any, limit: number): (string?, boolean)
+		local encoded = tern.json.encode(value)
+		return if #encoded <= limit then encoded else nil, #encoded > limit
+	end
+	local function objectList(value: any, field: string, limit: number, kind: string): (string?, boolean)
+		if type(value) ~= 'table' or type(value[field]) ~= 'table' then return entry(value, limit) end
+		local metadata = {}
+		for key, item in value do
+			if key ~= field then metadata[key] = item end
+		end
+		local prefix = (if next(metadata) then tern.json.encode(metadata):sub(1, -2) .. ',' else '{')
+			.. '"' .. field .. '":'
+		local items, truncated = list(value[field], limit - #prefix - 1, entry, kind)
+		if not items then return nil, true end
+		return prefix .. items .. '}', truncated
+	end
+	local function appendComments(label: string, encoded: string?, truncated: boolean)
+		table.insert(sections, '\n## ' .. label .. '\n')
+		if encoded then table.insert(sections, '\n```json\n' .. encoded .. '\n```\n') end
+		if truncated then table.insert(sections, '\n[This section reached the local size limit; remaining entries were omitted.]\n') end
+	end
 	append('Task and source', { identity = material.identity, account = material.account, head = material.head,
 		baseRef = material.baseRef, baseSHA = material.baseSHA, url = material.url,
 		title = material.title, fetchedAt = material.fetchedAt }, 6 * 1024)
 	append('Description', material.body, 48 * 1024)
 	append('GitHub mergeability observation (CONFLICTING means merge conflicts; UNKNOWN is not conflict-free)', material.mergeability, 2048)
-	append('Review threads', material.reviewThreads, 144 * 1024)
-	append('Overall review evidence (check each review commit against head)', material.overallReviews, 64 * 1024)
+	if material.reviewThreads then
+		appendComments('Review threads', list(material.reviewThreads, 144 * 1024, function(thread, limit)
+			return objectList(thread, 'comments', limit, 'inline')
+		end))
+	end
+	if material.overallReviews then
+		appendComments('Overall review evidence (check each review commit against head)', objectList(material.overallReviews, 'reviews', 64 * 1024, 'review'))
+	end
 	append('Current-version CI evidence', material.ci, 112 * 1024)
-	append('Discussion', material.discussion, 64 * 1024)
-	return table.concat(sections)
+	if material.discussion then
+		if material.head then
+			appendComments('PR conversation comments (not tied to a commit)', objectList(material.discussion, 'comments', 64 * 1024, 'conversation'))
+		else
+			appendComments('Discussion', list(material.discussion, 64 * 1024, entry))
+		end
+	end
+	return table.concat(sections), seen
 end
-local INITIAL_PR = '请用中文逐项处理未解决的审查线程和当前 PR 版本的 CI 证据。区分需要修改、已经处理、需要作者决定以及证据不足的事项，并在任务授权范围内逐项报告。'
-local INITIAL_REVIEW = '请用中文只读审核这个 PR。用 ternmate_review_read 的 evidence 参数先阅读 review.diff 和 materials.md，再用审核专用工具查看 worktree 源码。按严重程度报告可定位的问题、影响与验证缺口；没有问题也请说明审查范围。只在对话中报告，不修改文件，不运行项目代码，不向 GitHub 发布。'
+
+local function eachComment(material: any, visit: (string, any, any) -> ())
+	local function walk(kind: string, items: any, thread: any)
+		if type(items) ~= 'table' then return end
+		for _, item in ipairs(items) do
+			local id = commentId(kind, item)
+			if id then visit(id, item, thread) end
+		end
+	end
+	if type(material.discussion) == 'table' then walk('conversation', material.discussion.comments, nil) end
+	if type(material.overallReviews) == 'table' then walk('review', material.overallReviews.reviews, nil) end
+	if type(material.reviewThreads) == 'table' then
+		for _, thread in ipairs(material.reviewThreads) do
+			if type(thread) == 'table' then walk('inline', thread.comments, thread) end
+		end
+	end
+end
+
+local function initialComments(markdown: string): { [string]: boolean }
+	local function decodeSection(value: string): any
+		local decoded = runtime.decode(value)
+		if decoded then return decoded end
+		-- Old snapshots cut raw JSON mid-item. Recover only complete array
+		-- entries, closing their containers without keeping the trailing item.
+		local stack: { string } = {}
+		local quoted, escaped = false, false
+		local last, suffix = 0, ''
+		for i = 1, #value do
+			local ch = value:sub(i, i)
+			if quoted then
+				if escaped then escaped = false
+				elseif ch == '\\' then escaped = true
+				elseif ch == '"' then quoted = false end
+			elseif ch == '"' then quoted = true
+			elseif ch == '[' then table.insert(stack, ']')
+			elseif ch == '{' then table.insert(stack, '}')
+			elseif ch == ']' or ch == '}' then
+				if table.remove(stack) ~= ch then break end
+				if ch == '}' and stack[#stack] == ']' then
+					last = i
+					local closing = {}
+					for j = #stack, 1, -1 do table.insert(closing, stack[j]) end
+					suffix = table.concat(closing)
+				end
+			end
+		end
+		return if last > 0 then runtime.decode(value:sub(1, last) .. suffix) else nil
+	end
+	local material: any = {}
+	for label, value in markdown:gmatch('\n## ([^\n]+)\n\n```json\n(.-)\n```\n') do
+		if label == 'PR conversation comments (not tied to a commit)' or label == 'Discussion' then
+			local discussion = decodeSection(value)
+			if type(discussion) == 'table' then
+				material.discussion = if discussion.comments then discussion else { comments = discussion }
+			end
+		elseif label == 'Overall review evidence (check each review commit against head)' then
+			material.overallReviews = decodeSection(value)
+		elseif label == 'Review threads' then
+			material.reviewThreads = decodeSection(value)
+		end
+	end
+	local seen: { [string]: boolean } = {}
+	eachComment(material, function(id) seen[id] = true end)
+	return seen
+end
+
+local function commentDelta(material: any, seen: { [string]: boolean }): (string?, boolean)
+	local items = {}
+	local bytes, limited = 0, false
+	eachComment(material, function(id, comment, thread)
+		if seen[id] or limited then return end
+		local body: string = comment.body
+		local max = 12 * 1024
+		if #body > max then
+			while body:byte(max + 1) >= 128 and body:byte(max + 1) < 192 do max -= 1 end
+			body = body:sub(1, max) .. '\n[Comment truncated at the local size limit.]'
+		end
+		local item = tern.json.encode({
+			id = id, url = comment.url, author = comment.author, body = body,
+			state = comment.state, commit = comment.commit, originalCommit = comment.originalCommit,
+			onCurrentHead = comment.onCurrentHead, createdAt = comment.createdAt, submittedAt = comment.submittedAt,
+			thread = if thread then { id = thread.id, path = thread.path, line = comment.line or thread.line,
+				originalLine = comment.originalLine or thread.originalLine, outdated = comment.outdated or thread.isOutdated } else nil,
+		})
+		bytes += #item + 1
+		if bytes > 120 * 1024 then limited = true; return end
+		table.insert(items, item)
+		seen[id] = true
+	end)
+	if #items == 0 then return nil, limited end
+	return '[' .. table.concat(items, ',\n') .. ']', limited
+end
+
+local function commentExtension(): string
+	return '--trusted-extension=' .. tern.plugin.dir .. '/pr-comment-inbox.ts'
+end
+
+local PREVIOUS_PR = '请用中文逐项处理未解决的审查线程和当前 PR 版本的 CI 证据。区分需要修改、已经处理、需要作者决定以及证据不足的事项，并在任务授权范围内逐项报告。'
+local PREVIOUS_REVIEW = '请用中文只读审核这个 PR。用 ternmate_review_read 的 evidence 参数先阅读 review.diff 和 materials.md，再用审核专用工具查看 worktree 源码。按严重程度报告可定位的问题、影响与验证缺口；没有问题也请说明审查范围。只在对话中报告，不修改文件，不运行项目代码，不向 GitHub 发布。'
+local COMMENT_ANALYSIS = '请先逐项分析 PR Conversation 评论、整体 review 正文和未解决的行内审查线程，引用来源链接或文件行号并对照本地代码。区分仍成立、已处理、需作者决定和证据不足的问题；不要把旧版本意见当作当前故障，也不要把读取不全当作没有意见。'
+local INITIAL_PR = COMMENT_ANALYSIS .. ' 请用中文报告这些问题和当前 PR 版本的 CI 失败；仅在任务授权范围内处理。'
+local INITIAL_REVIEW = '请用中文只读审核这个 PR。用 ternmate_review_read 的 evidence 参数先阅读 review.diff 和 materials.md，再用审核专用工具查看固定版本源码。'
+	.. COMMENT_ANALYSIS .. ' 按严重程度报告可定位的问题、影响与验证缺口；没有问题也请说明审查范围。只在对话中报告，不修改文件，不运行项目代码，不向 GitHub 发布。'
 
 local function workCwd(record: Record): string
 	return record.dir .. '/worktree'
@@ -303,7 +468,7 @@ local function prPromptPath(record: Record): string
 	return record.dir .. '/system-prompt.md'
 end
 
-local function cliArgs(request: Request, record: Record, file: string?): { string }
+local function cliArgs(request: Request, record: Record, file: string?, withoutCommentInbox: boolean?): { string }
 	local issue = request.kind == ISSUE
 	local argv = { '--cwd=' .. sessionCwd(request, record), '--session-dir=' .. record.dir .. '/session' }
 	if not issue then
@@ -315,6 +480,7 @@ local function cliArgs(request: Request, record: Record, file: string?): { strin
 		end
 		-- An explicit empty override keeps OMP's default prompt and blocks worktree SYSTEM files.
 		table.insert(argv, '--system-prompt=')
+		if not withoutCommentInbox then table.insert(argv, commentExtension()) end
 	end
 	if request.review then
 		table.insert(argv, '--config=' .. tern.plugin.dir .. '/review-safety.yml')
@@ -353,17 +519,27 @@ local function confirmedExit(view: any, pane: any): any
 	return if block and block.keep_open == true and block.exited == pane.exited then session else nil
 end
 
-local function invocation(argv: any, request: Request, record: Record): boolean
+local function launchArgsMatch(argv: { string }, offset: number, request: Request, record: Record, file: string?): (boolean, boolean?)
+	local inbox = table.find(argv, commentExtension()) ~= nil
+	local expected = cliArgs(request, record, file, not inbox)
+	if #argv ~= #expected + offset then return false end
+	for index, argument in ipairs(expected) do
+		local actual = argv[index + offset]
+		if actual ~= argument then
+			-- Older processes still belong to this exact task. Only their initial prompt may differ.
+			if file or index ~= #expected or request.kind == ISSUE
+				or actual ~= (if request.review then PREVIOUS_REVIEW else PREVIOUS_PR) then return false end
+		end
+	end
+	return true, inbox
+end
+
+local function invocation(argv: any, request: Request, record: Record): (boolean, boolean?)
 	if type(argv) ~= 'table' or argv[1] ~= record.program then return false end
 	local last = argv[#argv]
 	local file = if type(last) == 'string' then last:match('^%-%-resume=(.+)$') else nil
 	if file and (not sessionPath(record.dir, file) or (record.file and file ~= record.file)) then return false end
-	local expected = cliArgs(request, record, file)
-	if #argv ~= #expected + 1 then return false end
-	for index, argument in ipairs(expected) do
-		if argv[index + 1] ~= argument then return false end
-	end
-	return true
+	return launchArgsMatch(argv, 1, request, record, file)
 end
 
 local function paneId(id: number): string
@@ -372,6 +548,40 @@ end
 
 local function taskKey(repo: runtime.Repo, identity: Identity, kind: string, number: number, checkout: string): string
 	return 'session-v2:' .. tern.json.encode({ repo.host:lower(), identity.repoId, identity.viewerId, kind, paneId(number), checkout })
+end
+
+local function historyScope(request: Request): string
+	local function hex(value: string): string
+		return (value:gsub('.', function(byte) return string.format('%02x', string.byte(byte)) end))
+	end
+	return hex(request.repo.host:lower()) .. '-' .. hex(request.identity.repoId) .. '-' .. hex(request.identity.viewerId)
+end
+
+function sessions.cleanupHistory(exec: runtime.Exec, request: Request, done: ({CleanupHistory}?, string?) -> ())
+	checkIdentity(request.repo, request.identity, function(problem)
+		if problem then done(nil, problem); return end
+		helper(exec, { 'cleanup-history', tern.plugin.data, historyScope(request) }, nil, function(result, err)
+			if not result or result.status ~= 0 or result.timed_out then done(nil, runtime.failure(result, err)); return end
+			local output = result.stdout
+			if output:sub(-4) ~= 'end\n' then done(nil, '历史未完整读取。'); return end
+			local rows: {CleanupHistory} = {}
+			for line in output:sub(1, -5):gmatch('[^\n]+') do
+				local at, kind, number, branch, head = line:match('^([^%c]+)\t(%a+)\t(%d+)\t([^%c]+)\t([0-9a-f]+)$')
+				local n = tonumber(number)
+				if not at or not at:match('^%d%d%d%d%-%d%d%-%d%dT%d%d:%d%d:%d%dZ$') or not n or not number or n < 1
+					or (kind ~= 'issue' and kind ~= 'pr' and kind ~= 'review') or not head or (#head ~= 40 and #head ~= 64)
+					or not branch or not branch:match('^ternmate/' .. (if kind == 'issue' then 'issue' else 'pr') .. '%-' .. number .. '%-%w+$') then
+					done(nil, '本地清理历史记录格式无效。'); return
+				end
+				table.insert(rows, { at = at, kind = kind, number = n, branch = branch, head = head })
+			end
+			for i = 1, math.floor(#rows / 2) do
+				local j = #rows + 1 - i
+				rows[i], rows[j] = rows[j], rows[i]
+			end
+			done(rows, nil)
+		end)
+	end)
 end
 
 local function prRecordValid(root: string, key: string, record: any, review: boolean?): boolean
@@ -421,7 +631,315 @@ function sessions.pushCommand(exec: runtime.Exec, repo: runtime.Repo, identity: 
 	end)
 end
 
--- Decoration only; activation still verifies the live process and session file.
+local cleanupProblems: {[number]: string} = {
+	[2] = '有未提交、未跟踪或被忽略的文件。',
+	[3] = '本地分支或 HEAD 不等于已合并的 PR head；可能有本地提交。',
+	[4] = '无法核对私有 worktree 或 Git 配置。',
+	[5] = '工作区有未完成的 Git 操作、锁或特殊索引标记，或 Git 拒绝移除。',
+	[7] = '工作区含子模块；为避免执行其 Git 配置，未清理。',
+	[8] = '此工作区已移除。',
+	[9] = '工作区已移除，但无法安全删除任务分支；保留了分支、对象库及对话。',
+}
+
+local function cleanupContext(exec: runtime.Exec, request: Request, done: (string?, string?, string?, string?) -> ())
+	if request.kind ~= 'pr' or not identityValid(request.identity) or not path(request.checkout)
+		or not runtime.alive(request.pane) then done(nil, nil, nil, 'PR 任务或来源面板已失效。'); return end
+	local function verified(head: string?, problem: string?)
+		if not head then done(nil, nil, nil, problem); return end
+		helper(exec, { 'source', request.checkout, tern.plugin.data }, nil, function(result, err)
+			local checkout: string?, data: string? = nil, nil
+			if result and result.status == 0 and not result.timed_out then
+				checkout, data = result.stdout:match('^([^\n]+)\n([^\n]+)\n$')
+			end
+			if not checkout or not path(checkout) or not data or not path(data) then
+				done(nil, nil, nil, '无法核对 checkout 或私有目录：' .. runtime.failure(result, err)); return
+			end
+			done(head, checkout, data, nil)
+		end)
+	end
+	if request.automatic then
+		if not request.automatic() then done(nil, nil, nil, '自动清理已取消。'); return end
+		materials.closedPRHead(exec, request.repo, request.identity, request.number, verified)
+	else
+		materials.mergedHead(exec, request.repo, request.identity, request.number, verified)
+	end
+end
+
+local function inspectCleanupPanes(exec: runtime.Exec, done: (any, string?) -> ())
+	helper(exec, { 'tern' }, nil, function(result, err)
+		local tool = if result and result.status == 0 and not result.timed_out then runtime.trim(result.stdout) else nil
+		if not tool or not path(tool) then done(nil, '无法确认 Tern 面板占用：' .. runtime.failure(result, err)); return end
+		inspect(exec, tool, nil, done)
+	end)
+end
+
+local function workspaceInUse(panes: {any}, record: Record): boolean
+	if record.phase == 'launching' then return true end
+	local function inside(value: any): boolean
+		return type(value) == 'string' and (value == record.dir or value:sub(1, #record.dir + 1) == record.dir .. '/')
+	end
+	for _, pane in panes do
+		if pane.exited == nil and (inside(pane.cwd) or inside(pane.omp_session_file) or candidate(pane, record)) then
+			return true
+		end
+	end
+	return false
+end
+
+function sessions.cleanupPreview(exec: runtime.Exec, request: Request, done: ({CleanupTarget}?, string?) -> ())
+	cleanupContext(exec, request, function(head, checkout, data, problem)
+		if not head or not checkout or not data then done(nil, problem); return end
+		local options: {CleanupTarget} = {}
+		local records: {Record} = {}
+		for _, review in {false, true} do
+			local key = taskKey(request.repo, request.identity, if review then 'pr-review-scoped' else 'pr', request.number, checkout)
+			local index, err = getIndex(key)
+			if not index then done(nil, err); return end
+			for version, record in index.records do
+				if prRecordValid(data .. SESSION_ROOT, version, record, review) and record.revision and record.revision.head == head then
+					table.insert(records, record)
+					table.insert(options, { dir = record.dir, version = record.revision, review = review,
+						problem = if busy[key] then '此任务正在打开或清理。' else nil })
+				end
+			end
+		end
+		if #options == 0 then done(nil, '此 checkout 没有匹配已合并 head 的本机工作区；旧版本未改动。'); return end
+		inspectCleanupPanes(exec, function(view, err)
+			if not view then done(nil, err); return end
+			local available: {CleanupTarget} = {}
+			local function check(position: number)
+				local option = options[position]
+				if not option then
+					table.sort(available, function(a, b) return if a.review ~= b.review then not a.review else a.dir < b.dir end)
+					if #available == 0 then done(nil, '此 PR 的匹配工作区已清理。') else done(available, nil) end
+					return
+				end
+				if not runtime.alive(request.pane) then done(nil, '来源面板已关闭。'); return end
+				if workspaceInUse(view.panes, records[position]) then option.problem = '请先退出占用此工作区的 Tern 会话。' end
+				if option.problem then
+					table.insert(available, option)
+					check(position + 1)
+					return
+				end
+				helper(exec, { 'cleanup-pr-check', data, option.dir, head, paneId(request.number) }, nil, function(result, checkError)
+					if not result or result.timed_out or result.status ~= 8 then
+						if not result or result.status ~= 0 or result.timed_out then
+							option.problem = (if result and not result.timed_out then cleanupProblems[result.status] else nil)
+								or runtime.failure(result, checkError)
+						end
+						table.insert(available, option)
+					end
+					check(position + 1)
+				end)
+			end
+			check(1)
+		end)
+	end)
+end
+
+function sessions.cleanPR(exec: runtime.Exec, request: Request, target: CleanupTarget, done: Done)
+	cleanupContext(exec, request, function(head, checkout, data, problem)
+		if not head or not checkout or not data then done(nil, problem); return end
+		if target.problem or target.version.head ~= head then done(nil, '确认后 PR head 或工作区状态已变化；请重新预览。'); return end
+		local key = taskKey(request.repo, request.identity, if target.review then 'pr-review-scoped' else 'pr', request.number, checkout)
+		if busy[key] then done(nil, '此任务正在打开或清理。'); return end
+		local version = versionKey(target.version)
+		local index, err = getIndex(key)
+		local record = if index then index.records[version] else nil
+		if not record or record.dir ~= target.dir or not prRecordValid(data .. SESSION_ROOT, version, record, target.review) then
+			done(nil, err or '任务记录已变化；请重新预览。'); return
+		end
+		busy[key] = true
+		local function finish(message: string?, failure: string?)
+			busy[key] = nil
+			done(message, failure)
+		end
+		inspectCleanupPanes(exec, function(view, inspectError)
+			if not view then finish(nil, inspectError); return end
+			if not runtime.alive(request.pane) or (request.automatic and not request.automatic()) or workspaceInUse(view.panes, record) then
+				finish(nil, '工作区仍在使用或来源面板已关闭；未执行清理。'); return
+			end
+			local env = { TERNMATE_CLEANUP_HISTORY = if request.automatic then historyScope(request) else '',
+				TERNMATE_CLEANUP_MODE = if target.review then 'review' else 'pr' }
+			helper(exec, { 'cleanup-pr', data, record.dir, head, paneId(request.number) }, {env = env}, function(result, writeError)
+				if result and result.status == 0 and not result.timed_out then
+					finish('已清理本地 worktree 和任务分支；对话、材料及对象库保留。', nil)
+				else
+					finish(nil, '未能完成清理：' .. ((if result and not result.timed_out then cleanupProblems[result.status] else nil)
+						or runtime.failure(result, writeError)))
+				end
+			end)
+		end)
+	end)
+end
+
+function sessions.cleanupBatchPreview(exec: runtime.Exec, request: Request, numbers: {number},
+	done: ({CleanupEntry}?, string?) -> ())
+	helper(exec, { 'source', request.checkout, tern.plugin.data }, nil, function(result, err)
+		local checkout = if result and result.status == 0 and not result.timed_out then result.stdout:match('^([^\n]+)\n') else nil
+		if not checkout or not path(checkout) then done(nil, '无法核对 checkout：' .. runtime.failure(result, err)); return end
+		local candidates: {number} = {}
+		for _, number in numbers do
+			for _, kind in {'pr', 'pr-review-scoped'} do
+				local index, problem = getIndex(taskKey(request.repo, request.identity, kind, number, checkout))
+				if not index then done(nil, problem); return end
+				if next(index.records) then table.insert(candidates, number); break end
+			end
+		end
+		local entries: {CleanupEntry} = {}
+		local function preview(position: number)
+			if not runtime.alive(request.pane) then done(nil, '来源面板已关闭。'); return end
+			local number = candidates[position]
+			if not number then
+				if #entries == 0 then done(nil, '匹配的已合并 PR 没有本机工作区。') else done(entries, nil) end
+				return
+			end
+			local item = table.clone(request)
+			item.number = number
+			sessions.cleanupPreview(exec, item, function(targets, problem)
+				if targets then
+					for _, target in targets do
+						table.insert(entries, { request = item, target = target, problem = target.problem })
+					end
+				else
+					table.insert(entries, { request = item, problem = problem or '不能核对工作区。' })
+				end
+				preview(position + 1)
+			end)
+		end
+		preview(1)
+	end)
+end
+
+function sessions.cleanBatch(exec: runtime.Exec, entries: {CleanupEntry}, done: ({CleanupEntry}, number) -> ())
+	local results: {CleanupEntry} = {}
+	local cleaned = 0
+	local function run(position: number)
+		for i = position, #entries do
+			local entry = table.clone(entries[i])
+			table.insert(results, entry)
+			if entry.target and not entry.problem then
+				sessions.cleanPR(exec, entry.request, entry.target, function(message, problem)
+					entry.cleaned = message ~= nil
+					entry.problem = if message then nil else problem or '不能清理工作区。'
+					if entry.cleaned then cleaned += 1 end
+					run(i + 1)
+				end)
+				return
+			end
+		end
+		done(results, cleaned)
+	end
+	run(1)
+end
+
+local function autoCleanIssue(exec: runtime.Exec, request: Request, checkout: string, data: string,
+	active: {[string]: boolean}, alive: () -> boolean, done: (number) -> ())
+	local key = taskKey(request.repo, request.identity, ISSUE, request.number, checkout)
+	if busy[key] then done(0); return end
+	local index = getIndex(key)
+	if not index then done(0); return end
+	local records = {}
+	for base, record in index.records do
+		if type(base) == 'string' and (oid(base) or (#base == 64 and base:match('^[0-9a-f]+$')))
+			and recordValid(data .. SESSION_ROOT, record) and active[record.dir] then
+			table.insert(records, { base = base, record = record })
+		end
+	end
+	if #records == 0 then done(0); return end
+	busy[key] = true
+	local cleaned = 0
+	local function finish()
+		busy[key] = nil
+		done(cleaned)
+	end
+	materials.closedIssueMergedHeads(exec, request.repo, request.identity, request.number, function(heads)
+		if not heads or not alive() then finish(); return end
+		inspectCleanupPanes(exec, function(view)
+			if not view then finish(); return end
+			local function remove(position: number)
+				if not alive() then finish(); return end
+				for i = position, #records do
+					local item = records[i]
+					if not workspaceInUse(view.panes, item.record) then
+						local argv = { 'cleanup-issue', data, item.record.dir, checkout, item.base, paneId(request.number) }
+						for _, head in heads do table.insert(argv, head) end
+						helper(exec, argv, {env = {TERNMATE_CLEANUP_HISTORY = historyScope(request)}}, function(result)
+							if result and result.status == 0 and not result.timed_out then cleaned += 1 end
+							remove(i + 1)
+						end)
+						return
+					end
+				end
+				finish()
+			end
+			remove(1)
+		end)
+	end)
+end
+
+local function sweepWorkspaces(exec: runtime.Exec, request: Request, snapshot: any, checkout: string, data: string,
+	active: {[string]: boolean}, alive: () -> boolean, done: (number) -> ())
+	local candidates = {}
+	for _, kind in {ISSUE, 'pr'} do
+		for _, row in (if kind == ISSUE then snapshot.issues else snapshot.prs) do
+			if row.state ~= 'CLOSED' and row.state ~= 'MERGED' then continue end
+			local function has(taskKind: string): boolean
+				local index = getIndex(taskKey(request.repo, request.identity, taskKind, row.number, checkout))
+				if not index then return false end
+				for _, record in index.records do
+					if recordValid(data .. SESSION_ROOT, record) and active[record.dir] then return true end
+				end
+				return false
+			end
+			if has(kind) or (kind == 'pr' and has('pr-review-scoped')) then table.insert(candidates, { kind = kind, number = row.number }) end
+		end
+	end
+	local cleaned = 0
+	local function run(position: number)
+		local item = candidates[position]
+		if not item or not alive() then done(cleaned); return end
+		local task = table.clone(request)
+		task.kind, task.number, task.automatic = item.kind, item.number, alive
+		local function resume(count: number)
+			cleaned += count
+			run(position + 1)
+		end
+		if item.kind == ISSUE then
+			autoCleanIssue(exec, task, checkout, data, active, alive, resume)
+		else
+			sessions.cleanupPreview(exec, task, function(targets)
+				local entries: {CleanupEntry} = {}
+				for _, target in targets or {} do table.insert(entries, { request = task, target = target, problem = target.problem }) end
+				sessions.cleanBatch(exec, entries, function(_, count) resume(count) end)
+			end)
+		end
+	end
+	run(1)
+end
+
+function sessions.autoCleanup(exec: runtime.Exec, request: Request, snapshot: any, alive: () -> boolean, done: (number) -> ())
+	if not alive() then done(0); return end
+	helper(exec, { 'source', request.checkout, tern.plugin.data }, nil, function(result)
+		local checkout: string?, data: string? = nil, nil
+		if result and result.status == 0 and not result.timed_out then checkout, data = result.stdout:match('^([^\n]+)\n([^\n]+)\n$') end
+		if not checkout or not data or not alive() then done(0); return end
+		helper(exec, { 'workspace-list', data }, nil, function(list)
+			if not list or list.timed_out or list.status ~= 0 or list.stdout:sub(-4) ~= 'end\n' or not alive() then
+				done(0); return
+			end
+			local active: {[string]: boolean} = {}
+			for name in list.stdout:sub(1, -5):gmatch('[^\n]+') do
+				if not name:match('^task%.[%w]+$') then done(0); return end
+				active[data .. SESSION_ROOT .. name] = true
+			end
+			if not next(active) then done(0); return end
+			sweepWorkspaces(exec, request, snapshot, checkout, data, active, alive, done)
+		end)
+	end)
+end
+
+-- Local session evidence is independent from remote delivery and acceptance.
 function sessions.issueBadges(repo: runtime.Repo, identity: Identity, checkout: string): (number) -> string
 	if not identityValid(identity) then return function() return '' end end
 	local liveCwds: { [number]: string } = {}
@@ -430,19 +948,53 @@ function sessions.issueBadges(repo: runtime.Repo, identity: Identity, checkout: 
 	end
 	return function(number: number): string
 		local index = getIndex(taskKey(repo, identity, ISSUE, number, checkout))
-		if not index then return '' end
+		if not index then return 'unknown' end
+		local best = 0
+		local statuses = {'prepared', 'retryable', 'launching', 'recorded'}
 		for _, record in index.records do
-			if type(record) == 'table' and record.phase == 'opened' and record.pane and path(record.dir) then
-				-- The host SDK lists live panes without argv. Match the unique task directory
-				-- (the launch cwd) or the worktree OMP changes into, not just a stored pane id.
+			if type(record) ~= 'table' or not path(record.dir) then continue end
+			if record.phase == 'opened' then
+				-- The host SDK lists live panes without argv. Match the task directory too.
 				local cwd = liveCwds[record.pane]
-				if cwd and (cwd == record.dir or cwd == workCwd(record)) then
-					return '处理中 · 本机 omp 面板已打开'
-				end
-			end
+				if cwd and (cwd == record.dir or cwd == workCwd(record)) then return 'running' end
+				best = 4
+			elseif record.phase == 'launching' then best = math.max(best, 3)
+			elseif record.phase == 'retryable' then best = math.max(best, 2)
+			elseif record.phase == 'prepared' then best = math.max(best, 1) end
 		end
-		return ''
+		return statuses[best] or ''
 	end
+end
+
+function sessions.issueWork(exec: runtime.Exec, repo: runtime.Repo, identity: Identity, checkout: string,
+	number: number, done: ({[string]: boolean}?) -> ())
+	if not identityValid(identity) then done(nil); return end
+	local index = getIndex(taskKey(repo, identity, ISSUE, number, checkout))
+	if not index then done({unknown = true}); return end
+	local argv = { 'issue-work', checkout, tern.plugin.data }
+	for base, record in index.records do
+		if type(base) ~= 'string' or not (oid(base) or (#base == 64 and base:match('^[0-9a-f]+$')))
+			or type(record) ~= 'table' or not path(record.dir) then continue end
+		local root = record.dir:match('^(.-/task%-sessions%-v2/)task%.[%w]+$')
+		if not root or not recordValid(root, record) then continue end
+		table.insert(argv, record.dir)
+		table.insert(argv, base)
+	end
+	if #argv == 3 then
+		done(if next(index.records) then {unknown = true} else nil)
+		return
+	end
+	helper(exec, argv, nil, function(result)
+		if not result or result.status ~= 0 or result.timed_out then done({unknown = true}); return end
+		local state: {[string]: boolean} = {}
+		local count = 0
+		for lineage, dirty in result.stdout:gmatch('([%a]+) ([%a]+)\n') do
+			count += 1
+			state[lineage], state[dirty] = true, true
+		end
+		if count ~= (#argv - 3) / 2 then done({unknown = true}); return end
+		done(state)
+	end)
 end
 
 local function sameCwd(exec: runtime.Exec, actual: any, expected: string, cb: (boolean) -> ())
@@ -557,23 +1109,114 @@ local function openVerified(exec: runtime.Exec, request: Request, progress: (str
 					end)
 				end
 				local updateNote = ''
-				local function verifyProcess(window: string, pane: number, record: Record, cb: (boolean) -> ())
+				local function verifyProcess(window: string, pane: number, record: Record, cb: (boolean, boolean?) -> ())
 					exec({ tool, 'process', paneId(pane), '--json', '--window=' .. window }, nil, function(result, err)
 						local info = runtime.json(result, err)
 						if not info or info.pane ~= pane then cb(false); return end
 						local child = info.child
-						if not child or not invocation(child.argv, request, record) then child = info.foreground end
-						if not child or not invocation(child.argv, request, record) then cb(false); return end
-						if not request.review and child.cwd == record.dir then cb(true)
-						else sameCwd(exec, child.cwd, sessionCwd(request, record), cb) end
+						local ok: boolean?, inbox: boolean? = nil, nil
+						if child then ok, inbox = invocation(child.argv, request, record) end
+						if not ok then
+							child = info.foreground
+							if not child then cb(false); return end
+							ok, inbox = invocation(child.argv, request, record)
+						end
+						if not child or not ok then cb(false); return end
+						if not request.review and child.cwd == record.dir then cb(true, inbox)
+						else sameCwd(exec, child.cwd, sessionCwd(request, record), function(matches) cb(matches, inbox) end) end
 					end)
 				end
 				local function useRecord(version: string, record: Record)
 					local note = updateNote
 					local cwd = sessionCwd(request, record)
 					local revision = record.revision
-					local function running(window: string, pane: number, cb: (boolean) -> ())
-						verifyProcess(window, pane, record, cb)
+					local function refreshComments(file: string?, nextStep: () -> ())
+						if not revision or request.retained then nextStep(); return end
+						local pinned = revision
+						local function report(text: string)
+							note ..= ' ' .. text
+							nextStep()
+						end
+						if not file or not sessionPath(record.dir, file) then
+							report('会话文件尚未确认；请稍后再次点击检查新增评论。'); return
+						end
+						local targetFile = file
+						progress('正在检查 PR 新增评论…')
+						helper(exec, { 'comment-state', record.dir }, nil, function(result, err)
+							if not result or result.status ~= 0 or result.timed_out then
+								report('无法读取评论投递记录：' .. runtime.failure(result, err)); return
+							end
+							local receipt, content = result.stdout:match('^([^\n]+)\n(.*)$')
+							local state: any
+							if receipt == 'initial' and content then
+								state = { serial = 0, seen = initialComments(content), pending = {}, baseline = true }
+							elseif receipt == 'baseline' and content then
+								local seen = runtime.decode(content)
+								if not seen then report('PR 评论基线无效；未提交评论。'); return end
+								for id, included in pairs(seen) do
+									if type(id) ~= 'string' or included ~= true then report('PR 评论基线无效；未提交评论。'); return end
+								end
+								state = { serial = 0, seen = seen, pending = {}, baseline = true }
+							else
+								local delivered = tonumber(receipt)
+								state = if delivered and content then runtime.decode(content) else nil
+								if type(state) ~= 'table' or type(state.serial) ~= 'number' or state.serial % 1 ~= 0
+									or state.serial < 1 or state.serial >= 2^53 - 1 or type(state.seen) ~= 'table'
+									or type(state.pending) ~= 'table' or not delivered or delivered < 0 or delivered > state.serial then
+									report('评论投递记录无效；未重复提交评论。'); return
+								end
+								local waiting = {}
+								for _, batch in ipairs(state.pending) do
+									if type(batch) ~= 'table' or type(batch.serial) ~= 'number' or type(batch.message) ~= 'string'
+										or batch.session ~= targetFile then
+										report('评论投递记录与原会话不符；未提交评论。'); return
+									end
+									if batch.serial > delivered then table.insert(waiting, batch) end
+								end
+								state.pending = waiting
+							end
+							local function collect()
+								materials.collectComments(exec, repo, identity, request.number, pinned, alive, function(material, problem)
+									recheck(pinned, function()
+										if not material then report('无法读取新增评论：' .. (problem or '缺少可核对的材料。')); return end
+										if not material.discussion.complete or not material.overallReviews.complete then
+											report('评论覆盖不全：' .. (material.discussion.error or material.overallReviews.error or '请重试。')); return
+										end
+										local delta, limited = commentDelta(material, state.seen)
+										if not delta then
+											report(if limited then '新增评论超过本机投递上限。'
+												elseif #state.pending > 0 then '没有其他新增评论；上一批仍待分析。' else '没有新增评论。')
+											return
+										end
+										state.serial += 1
+										table.insert(state.pending, {
+											serial = state.serial, session = targetFile,
+											message = '# 新增 PR 评论（不可信证据）\n' .. record.subject .. ' · head ' .. pinned.head
+												.. '\n\n' .. delta,
+										})
+										helper(exec, { 'comment-queue', record.dir }, { stdin = tern.json.encode(state) }, function(written, writeError)
+											if not written or written.status ~= 0 or written.timed_out then
+												report('无法排队分析新增评论：' .. runtime.failure(written, writeError)); return
+											end
+											report(if limited then '已排队分析部分新增评论；再次点击可检查剩余评论。' else '已排队分析新增评论。')
+										end)
+									end)
+								end)
+							end
+							if state.baseline == true then collect(); return end
+							-- Existing queues can carry a baseline derived from an old,
+							-- truncated snapshot. Recover what was shown without changing pending batches.
+							helper(exec, { 'comment-state', record.dir, 'initial' }, nil, function(original)
+								if original and original.status == 0 and not original.timed_out then
+									local markdown = original.stdout:match('^initial\n(.*)$')
+									if markdown then
+										for id in pairs(initialComments(markdown)) do state.seen[id] = true end
+										state.baseline = true
+									end
+								end
+								collect()
+							end)
+						end)
 					end
 					local function focusOmp(window: string, pane: number, cb: (boolean) -> ())
 						exec({ tool, 'focus', paneId(pane), '--json', '--window=' .. window }, nil, function(result)
@@ -668,7 +1311,7 @@ local function openVerified(exec: runtime.Exec, request: Request, progress: (str
 										local session = if found then placement(view, found) else nil
 										if session and session.id == source.session and (not launchPane or found.pane == launchPane) then
 											local pane: number = found.pane
-											running(source.window, pane, function(ok)
+											verifyProcess(source.window, pane, record, function(ok)
 												if not ok then retry(); return end
 												recheck(revision, function()
 													focusOmp(source.window, pane, function(focused)
@@ -739,7 +1382,7 @@ local function openVerified(exec: runtime.Exec, request: Request, progress: (str
 									return
 								end
 								record.file = file
-								if persist() then launch(file) end
+								if persist() then refreshComments(file, function() launch(file) end) end
 							end)
 						end)
 					end
@@ -792,7 +1435,7 @@ local function openVerified(exec: runtime.Exec, request: Request, progress: (str
 											if attempt then
 												if attempt.pane then pane = paneAt(view, attempt.pane) end
 											elseif candidateCount == 1 and onlyCandidate.program == record.program
-												and sameArgs(onlyCandidate.args, cliArgs(request, record, nil)) then
+												and type(onlyCandidate.args) == 'table' and launchArgsMatch(onlyCandidate.args, 0, request, record, nil) then
 												-- Without a launch receipt, only unique exact argv can identify a legacy attempt.
 												pane = onlyCandidate
 											end
@@ -840,7 +1483,7 @@ local function openVerified(exec: runtime.Exec, request: Request, progress: (str
 									if not pane or pane.exited ~= nil or not candidate(pane, record) or not alive() or not placement(state, pane) then
 										finish(nil, err or '待聚焦面板已变化，请重试。'); return
 									end
-									running(window, pane.pane, function(ok)
+									verifyProcess(window, pane.pane, record, function(ok, inbox)
 										if not ok or not alive() then
 											finish(nil, if request.review then '无法确认原进程使用受限审核工具；不聚焦面板，保留旧会话。'
 												else '原面板没有运行预期的 omp 进程。')
@@ -848,8 +1491,20 @@ local function openVerified(exec: runtime.Exec, request: Request, progress: (str
 										end
 										recheck(revision, function()
 											focusOmp(window, pane.pane, function(focused)
-												if focused then opened(pane.pane, '已聚焦原 omp 会话。')
-												else finish(nil, '不能聚焦原 omp 会话。') end
+												if not focused then finish(nil, '不能聚焦原 omp 会话。'); return end
+												local function complete() opened(pane.pane, '已聚焦原 omp 会话。') end
+												if not revision or request.retained then complete(); return end
+												if not inbox then
+													note ..= ' 此进程早于评论投递功能；正常退出后再次点击，即可恢复原对话并分析新增评论。'
+													complete()
+													return
+												end
+												local activeFile = pane.omp_session_file or record.file
+												if activeFile then
+													refreshComments(activeFile, complete)
+												else
+													uniqueFile(exec, record.dir, function(discovered) refreshComments(discovered, complete) end)
+												end
 											end)
 										end)
 									end)
@@ -861,6 +1516,13 @@ local function openVerified(exec: runtime.Exec, request: Request, progress: (str
 					if request.kind == ISSUE then
 						helper(exec, { 'check-issue', record.dir, checkout }, nil, function(worktree, problem)
 							if worktree and worktree.status == 0 then locate()
+							elseif worktree and worktree.status == 6 and not worktree.timed_out and alive() then
+								helper(exec, { 'restore-issue', data, record.dir, checkout, version, paneId(request.number) }, {timeout_ms = 180000}, function(restored, err)
+									if restored and not restored.timed_out and restored.status == 0 then
+										note ..= ' 已重建 Issue 工作区。'
+										locate()
+									else finish(nil, '无法恢复已清理的 Issue 工作区：' .. runtime.failure(restored, err)) end
+								end)
 							else finish(nil, '无法核对保留的 Issue worktree；未覆盖或删除任何文件。' .. runtime.failure(worktree, problem)) end
 						end)
 						return
@@ -872,25 +1534,39 @@ local function openVerified(exec: runtime.Exec, request: Request, progress: (str
 						table.insert(args, revision.baseSHA)
 						table.insert(args, revision.baseRef)
 					end
-					helper(exec, args, nil, function(worktree, problem)
-						local head: string?, state: string? = nil, nil
-						if worktree and worktree.status == 0 then head, state = worktree.stdout:match('^([^\n]+)\n([^\n]+)\n$') end
-						if not head or not oid(head) or (state ~= 'dirty' and state ~= 'clean' and state ~= 'unknown') then
-							finish(nil, '无法核对保留的 PR worktree；未覆盖或删除任何文件。' .. runtime.failure(worktree, problem)); return
-						end
-						if request.review then
-							if state ~= 'clean' or head ~= revision.head then
-								finish(nil, '审核工作区已变化；不会审核不同于此 PR 版本的本地代码。'); return
+					local function readWorktree(mayRestore: boolean)
+						helper(exec, args, nil, function(worktree, problem)
+							if mayRestore and worktree and not worktree.timed_out and worktree.status == 6 and alive() then
+								progress('正在从已保留的对象库重建 worktree…')
+								helper(exec, { 'restore-pr', record.dir, revision.head, paneId(request.number) }, {timeout_ms = 180000}, function(restored, restoreError)
+									if not restored or restored.timed_out or restored.status ~= 0 then
+										finish(nil, '无法重建已清理的 PR 工作区：' .. runtime.failure(restored, restoreError)); return
+									end
+									note ..= ' 已重建工作区，原对话已保留。'
+									readWorktree(false)
+								end)
+								return
 							end
-						elseif state == 'dirty' then
-							note ..= ' 未提交修改已保留。'
-						elseif state == 'unknown' then
-							note ..= ' Git 配置已变化，未执行状态检查。'
-						end
-						if head ~= revision.head then note ..= ' 当前本地 HEAD ' .. head:sub(1, 12) .. '；未切换提交。' end
-						if request.retained then note ..= ' 正在继续所选旧版本 ' .. versionLabel(revision) .. '；没有加载当前 PR 材料。' end
-						locate()
-					end)
+							local head: string?, state: string? = nil, nil
+							if worktree and worktree.status == 0 then head, state = worktree.stdout:match('^([^\n]+)\n([^\n]+)\n$') end
+							if not head or not oid(head) or (state ~= 'dirty' and state ~= 'clean' and state ~= 'unknown') then
+								finish(nil, '无法核对保留的 PR worktree；未覆盖或删除任何文件。' .. runtime.failure(worktree, problem)); return
+							end
+							if request.review then
+								if state ~= 'clean' or head ~= revision.head then
+									finish(nil, '审核工作区已变化；不会审核不同于此 PR 版本的本地代码。'); return
+								end
+							elseif state == 'dirty' then
+								note ..= ' 未提交修改已保留。'
+							elseif state == 'unknown' then
+								note ..= ' Git 配置已变化，未执行状态检查。'
+							end
+							if head ~= revision.head then note ..= ' 当前本地 HEAD ' .. head:sub(1, 12) .. '；未切换提交。' end
+							if request.retained then note ..= ' 正在继续所选旧版本 ' .. versionLabel(revision) .. '；没有加载当前 PR 材料。' end
+							locate()
+						end)
+					end
+					readWorktree(true)
 				end
 				local function prepare(version: string, head: string, revision: Version?)
 					progress('正在读取任务材料…')
@@ -900,8 +1576,12 @@ local function openVerified(exec: runtime.Exec, request: Request, progress: (str
 							recheck(revision, function() finish(nil, problem or '无法读取任务材料。') end)
 							return
 						end
-						local ok, encoded = pcall(materialText, material)
-						if not ok or type(encoded) ~= 'string' or #encoded > MATERIAL_LIMIT then
+						local ok, encoded, baseline = pcall(function()
+							local markdown, seen = materialText(material)
+							return markdown, if revision then tern.json.encode(seen) else nil
+						end)
+						if not ok or type(encoded) ~= 'string' or #encoded > MATERIAL_LIMIT
+							or (baseline and #baseline > MATERIAL_LIMIT) then
 							finish(nil, '无法编码有界的任务材料。'); return
 						end
 						local config = data:match('^(.*)/plugin%-data/[^/]+$') or data
@@ -916,8 +1596,10 @@ local function openVerified(exec: runtime.Exec, request: Request, progress: (str
 									subject = runtime.repoKey(repo) .. ' ' .. request.kind .. ' #' .. paneId(request.number),
 								}
 								if not recordValid(root, record) then finish(nil, '私有任务目录不在插件数据目录内。'); return end
-								helper(exec, { 'material', dir }, { stdin = encoded }, function(written, writeError)
-									if not written or written.status ~= 0 then finish(nil, '不能写入私有任务材料：' .. runtime.failure(written, writeError)); return end
+								local args = { 'material', dir }
+								if baseline then table.insert(args, 'baseline') end
+								helper(exec, args, { stdin = if baseline then baseline .. '\n' .. encoded else encoded }, function(written, writeError)
+									if not written or written.status ~= 0 or written.timed_out then finish(nil, '不能写入私有任务材料：' .. runtime.failure(written, writeError)); return end
 									local function prepared()
 										index.records[version] = record
 										if persist() then useRecord(version, record) end

@@ -15,14 +15,19 @@ type Prefs = { filters: Filters, selected: number?, position: number?, repoId: s
 type Saved = { checkout: string?, repo: string?, kind: string,
 	filtersByRepo: { [string]: { [string]: Prefs } }, maintenanceByRepo: { [string]: any }?, reviewMode: boolean? }
 type Confirm = { number: number, identity: Identity, notice: sessions.Notice, serial: number }
+type Cleanup = { entries: {sessions.CleanupEntry}, serial: number, page: number, batch: boolean?, cleaned: number? }
+type History = { rows: {sessions.CleanupHistory}?, error: string?, page: number }
 type Editor = { key: string, text: string, caret: number, error: string? }
 type Listing = { data: {rows: {Row}, uncertain: number}, position: number }
+type IssueLinks = { reason: string?, complete: boolean, groups: { [string]: {string} } }
+type IssueWork = { number: number, checked: boolean?, facts: {[string]: boolean}?, timer: TimerHandle? }
 type Scope = { identity: Identity, snapshot: any?, baseline: any?, checked: number?, loading: boolean?, hydrated: boolean?,
 	forceRefresh: boolean?, cancelSync: (() -> ())?,
 	checkingRevision: boolean?, revisionError: string?, focusPending: boolean?,
-	links: {[number]: string}?,
+	links: {[number]: IssueLinks}?,
 	issuesOpen: number?, prsOpen: number?, reviewOpen: number?,
-	timer: TimerHandle?, errors: number?, error: string? }
+	timer: TimerHandle?, errors: number?, error: string?,
+	autoCleaning: boolean?, autoCleaned: number? }
 type IdentityBinding = { identity: Identity? }
 type ScopeCallback = (Scope?, string?) -> ()
 type State = {
@@ -31,13 +36,17 @@ type State = {
 	read: Scope?, identityWait: { ScopeCallback }?, verifying: boolean?, listError: string?,
 	binding: IdentityBinding,
 	opening: number?, progress: string?, taskError: string?, confirm: Confirm?,
+	cleanup: Cleanup?,
+	history: History?,
 	panel: any?,
+	issueWork: IssueWork?,
 }
 type Choice = { string }
 type Field = { key: string, title: string, choices: { Choice }? }
 type Preset = { title: string, filters: Filters }
 
 local ISSUE = "issue"
+local CLEANUP_PAGE = 4
 local PR = "pr"
 local PAGE = 20
 local EDIT_INPUT = "layer.editor.input"
@@ -47,6 +56,15 @@ local SYNC_MS = 300_000
 local IDENTITY_CHANGED = "仓库或登录账号已变化；请刷新任务列表。"
 local states: { Choice } = { { "OPEN", "开放" }, { "CLOSED", "已关闭" } }
 local prStates: { Choice } = { { "OPEN", "开放" }, { "MERGED", "已合并" }, { "CLOSED", "关闭未合并" } }
+local localIssueNames: {[string]: string} = {
+	running = "本机会话打开", recorded = "有本机会话记录", prepared = "工作区已准备",
+	retryable = "会话启动可重试", launching = "会话启动待确认", unknown = "本机会话状态未知",
+}
+local issueCloseReasons: {[string]: string} = { COMPLETED = "已完成", NOT_PLANNED = "不计划", DUPLICATE = "重复" }
+local linkedStates = {
+	{ "merged", "已合并", "success" }, { "open", "待合并", "info" },
+	{ "draft", "草稿", "muted" }, { "closed", "关闭未合并", "warning" },
+}
 local ciNames: { [string]: string } = { none = "无检查", success = "CI 通过", pending = "CI 进行中", failure = "CI 失败", unknown = "CI 未知" }
 local ciChoices: { Choice } = {}
 for _, key in { "failure", "pending", "success", "none", "unknown" } do table.insert(ciChoices, { key, ciNames[key] }) end
@@ -81,6 +99,7 @@ local presets: { [string]: { Preset } } = {
 		{ title = "未解决线程", filters = { state = "OPEN", threads = "yes" } },
 		{ title = "CI 失败", filters = { state = "OPEN", ci = "failure" } },
 		{ title = "我的待处理 PR", filters = { state = "OPEN", author = "@me", actionable = "yes" } },
+		{ title = "已合并", filters = { state = "MERGED" } },
 		{ title = "全部状态", filters = {} },
 	},
 }
@@ -121,6 +140,10 @@ local function invalidateScope(state: State, err: string?)
 	local previous = state.read
 	if previous and previous.timer then previous.timer:cancel() end
 	if previous and previous.cancelSync then previous.cancelSync() end
+	if state.issueWork and state.issueWork.timer then state.issueWork.timer:cancel() end
+	state.issueWork = nil
+	state.cleanup = nil
+	state.history = nil
 	state.read, state.listing, state.listError = nil, nil, err
 	-- Retire the old storage capability, including callbacks from a closed panel.
 	state.binding, state.panel = {}, nil
@@ -157,30 +180,28 @@ local function readScope(state: State, cx: BlockCx, repo: Repo, done: ScopeCallb
 	end)
 end
 
--- GitHub numbers are only repository-local. Join on node ID so that a
--- cross-repository closing reference cannot mark an unrelated local Issue.
 local function install(scope: Scope, snapshot: any)
 	if scope.snapshot == snapshot and scope.links then return end
-	local numbers: {[string]: number} = {}
-	for _, issue in snapshot.issues do numbers[issue.id] = issue.number end
-	local linked: {[number]: {string}} = {}
-	for _, pr in snapshot.prs do
-		local refs = pr.closingIssuesReferences
-		if not refs or not refs.nodes then continue end
-		for _, issue in refs.nodes do
-			local number = numbers[issue.id]
-			if not number then continue end
-			local badges = linked[number] or {}
-			linked[number] = badges
-			local status = if pr.state == "MERGED" then "已合并" elseif pr.state == "OPEN" then "开放" else "已关闭"
-			table.insert(badges, "PR #" .. pr.number .. " " .. status)
-		end
-	end
-	local labels: {[number]: string} = {}
-	for number, badges in linked do labels[number] = table.concat(badges, "、") end
-	scope.snapshot, scope.links = snapshot, labels
+	local links: {[number]: IssueLinks} = {}
 	local issues, prs, ready = 0, 0, 0
-	for _, issue in snapshot.issues do if issue.state == "OPEN" then issues += 1 end end
+	for _, issue in snapshot.issues do
+		if issue.state == "OPEN" then issues += 1 end
+		local refs = issue.closedByPullRequestsReferences
+		local complete = type(refs) == "table" and type(refs.pageInfo) == "table" and refs.pageInfo.hasNextPage == false
+		local groups: {[string]: {string}} = {}
+		if type(refs) == "table" and type(refs.nodes) == "table" then
+			for _, pr in refs.nodes do
+				local status = if pr.state == "MERGED" then "merged" elseif pr.state == "CLOSED" then "closed"
+					elseif pr.isDraft then "draft" else "open"
+				local group = groups[status] or {}
+				groups[status] = group
+				table.insert(group, if pr.repository.id == scope.identity.repoId then "#" .. pr.number
+					else pr.repository.nameWithOwner .. "#" .. pr.number)
+			end
+		end
+		links[issue.number] = { reason = issue.stateReason, complete = complete, groups = groups }
+	end
+	scope.snapshot, scope.links = snapshot, links
 	for _, pr in snapshot.prs do
 		if pr.state == "OPEN" then
 			prs += 1
@@ -190,7 +211,34 @@ local function install(scope: Scope, snapshot: any)
 	scope.issuesOpen, scope.prsOpen, scope.reviewOpen = issues, prs, ready
 end
 
-local function project(state: State, scope: Scope, preserve: boolean)
+local function refreshIssueWork(state: State, cx: BlockCx, force: boolean?)
+	local list, scope, checkout, repo = state.listing, state.read, state.saved.checkout, state.repo
+	local row = if kindFor(state) == ISSUE and list then list.data.rows[list.position] else nil
+	local previous = state.issueWork
+	if not row or not scope or not checkout or not repo then
+		if previous and previous.timer then previous.timer:cancel() end
+		state.issueWork = nil
+		return
+	end
+	if not force and previous and previous.number == row.number then return end
+	if previous and previous.timer then previous.timer:cancel() end
+	local observed: IssueWork = { number = row.number }
+	state.issueWork = observed
+	local function alive(): boolean
+		return state.issueWork == observed and state.read == scope and runtime.alive(cx.pane)
+	end
+	observed.timer = tern.timer(120, function()
+		observed.timer = nil
+		if not alive() then return end
+		sessions.issueWork(runtime.exec, repo, scope.identity, checkout, row.number, function(facts)
+			if not alive() then return end
+			observed.facts, observed.checked = facts, true
+			cx:render()
+		end)
+	end)
+end
+
+local function project(state: State, cx: BlockCx, scope: Scope, preserve: boolean)
 	local repo = state.repo
 	if not repo or not scope.snapshot then return end
 	local prefs = pref(state, repo)
@@ -212,6 +260,7 @@ local function project(state: State, scope: Scope, preserve: boolean)
 	end
 	state.listing = { data = { rows = rows, uncertain = uncertain }, position = position }
 	state.generation += 1
+	refreshIssueWork(state, cx)
 end
 
 local function copyRows(rows: {any}): {any}
@@ -252,7 +301,7 @@ local function synchronize(state: State, cx: BlockCx, repo: Repo, scope: Scope, 
 			-- Only the preview owns these arrays. Keep the complete mirror for
 			-- subsequent scans, and recompute counts/links when publishing.
 			install(scope, table.clone(preview))
-			project(state, scope, true)
+			project(state, cx, scope, true)
 		end
 		maintenance.sync(repo, scope.identity, baseline, active, function(snapshot, err, changedIdentity, changedRevision)
 			if not active() then return end
@@ -272,7 +321,23 @@ local function synchronize(state: State, cx: BlockCx, repo: Repo, scope: Scope, 
 				scope.baseline = snapshot
 				install(scope, snapshot)
 				scope.checked, scope.errors = tern.now(), 0
-				if changed or not state.listing then project(state, scope, true) end
+				if changed or not state.listing then project(state, cx, scope, true) end
+				local checkout = state.saved.checkout
+				if not err and checkout and not scope.autoCleaning and not state.opening and not state.cleanup then
+					scope.autoCleaning = true
+					local request: sessions.Request = { repo = repo, identity = scope.identity, checkout = checkout,
+						kind = PR, number = 0, pane = cx.pane }
+					sessions.autoCleanup(runtime.exec, request, snapshot, function()
+						return alive() and not state.opening and not state.cleanup and state.saved.checkout == checkout
+					end, function(cleaned)
+						scope.autoCleaning = false
+						if cleaned > 0 and alive() then
+							scope.autoCleaned = (scope.autoCleaned or 0) + cleaned
+							refreshIssueWork(state, cx, true)
+							cx:render()
+						end
+					end)
+				end
 			else
 				if hasPending then paint() end
 				scope.errors = math.min(3, (scope.errors or 0) + 1)
@@ -336,7 +401,7 @@ local function synchronize(state: State, cx: BlockCx, repo: Repo, scope: Scope, 
 		if snapshot then
 			scope.baseline = snapshot
 			install(scope, snapshot)
-			project(state, scope, true)
+			project(state, cx, scope, true)
 			local function checkCache()
 				local expected = snapshot.resultRevision
 				if not scope.focusPending or scope.forceRefresh or not expected then
@@ -398,7 +463,12 @@ local function reload(state: State, cx: BlockCx, preserve: boolean, force: boole
 	if not repo then return end
 	local scope = state.read
 	if scope then
-		if force then synchronize(state, cx, repo, scope, true) else project(state, scope, preserve) end
+		if force then
+			refreshIssueWork(state, cx, true)
+			synchronize(state, cx, repo, scope, true)
+		else
+			project(state, cx, scope, preserve)
+		end
 		return
 	end
 	if state.verifying and not force then return end
@@ -472,6 +542,7 @@ local function openTask(state: State, cx: BlockCx, identity: Identity, kind: str
 				state.confirm = { number = number, identity = identity, notice = notice, serial = state.generation }
 			end
 			cx:render()
+			if kind == ISSUE then refreshIssueWork(state, cx, true) end
 		end)
 end
 
@@ -688,13 +759,14 @@ local function pageAt(list: Listing): number
 	return math.ceil(math.max(1, list.position) / PAGE)
 end
 
-local function selectAdjacentPage(state: State, list: Listing, page: number)
+local function selectAdjacentPage(state: State, cx: BlockCx, list: Listing, page: number)
 	if page >= 1 and math.abs(page - pageAt(list)) == 1 then
 		choosePosition(state, (page - 1) * PAGE + 1)
+		refreshIssueWork(state, cx)
 	end
 end
 
-local function navigation(state: State, offset: number)
+local function navigation(state: State, cx: BlockCx, offset: number)
 	local list = state.listing
 	if not list then return end
 	local data = list.data
@@ -702,6 +774,7 @@ local function navigation(state: State, offset: number)
 	local target = math.max(1, list.position + offset)
 	if target <= #data.rows then choosePosition(state, target)
 	else choosePosition(state, #data.rows) end
+	refreshIssueWork(state, cx)
 end
 
 local function button(label: string, action: string, active: boolean?, disabled: boolean?, variant: ("primary" | "quiet")?): Node
@@ -760,6 +833,77 @@ local function taskDock(state: State, busy: boolean): { Node }
 		table.insert(dock, wrapRow(choices))
 	end
 	return dock
+end
+
+local function cleanupView(cleanup: Cleanup): Node
+	local request = cleanup.entries[1].request
+	local count = #cleanup.entries
+	local totalPages = math.ceil(count / CLEANUP_PAGE)
+	local body: {Node} = {
+		text(request.repo.host .. " · " .. request.repo.owner .. "/" .. request.repo.name, "strong"),
+	}
+	if cleanup.cleaned ~= nil then
+		table.insert(body, text("已清理 " .. cleanup.cleaned .. " 项；未清理 " .. (count - cleanup.cleaned) .. " 项。", "strong"))
+	else
+		table.insert(body, text(if cleanup.batch then
+			"范围：当前筛选的所有页。仅清理预览中可清理的工作区；执行前逐项复核。"
+			else "只移除所选本地 worktree 和任务分支。保留会话、材料和 Git 对象库。"))
+	end
+	local first = (cleanup.page - 1) * CLEANUP_PAGE + 1
+	for i = first, math.min(first + CLEANUP_PAGE - 1, count) do
+		local entry = cleanup.entries[i]
+		local target = entry.target
+		local label = "PR #" .. entry.request.number
+		if target then
+			label ..= " · " .. (if target.review then "审核" else "开发") .. " · " .. versionLabel(target.version)
+		end
+		table.insert(body, text(label, "strong"))
+		if target then table.insert(body, text(target.dir .. "/worktree")) end
+		if entry.problem then table.insert(body, text(entry.problem, "warning"))
+		elseif cleanup.cleaned ~= nil then table.insert(body, text("已清理", "success"))
+		elseif cleanup.batch then table.insert(body, text("可清理", "success"))
+		else table.insert(body, ui.row({ button("确认清理此工作区", "cleanup_run=" .. cleanup.serial .. ":" .. i) })) end
+	end
+	local actions = { button(if cleanup.cleaned ~= nil then "关闭" else "取消", "cleanup_cancel") }
+	if totalPages > 1 then
+		table.insert(actions, button("上一页", "cleanup_back", nil, cleanup.page == 1))
+		table.insert(actions, button("下一页", "cleanup_next", nil, cleanup.page == totalPages))
+		table.insert(body, text("第 " .. cleanup.page .. " / " .. totalPages .. " 页"))
+	end
+	if cleanup.batch and cleanup.cleaned == nil then
+		local ready = 0
+		for _, entry in cleanup.entries do if entry.target and not entry.problem then ready += 1 end end
+		table.insert(actions, button("确认清理 " .. ready .. " 项", "cleanup_run=" .. cleanup.serial .. ":0", nil, ready == 0))
+	end
+	return dialog("cleanup", if cleanup.cleaned ~= nil then "批量清理结果" elseif cleanup.batch then "批量清理已合并 PR" else "清理已合并 PR", body, actions)
+end
+
+local function historyView(repo: Repo, history: History): Node
+	local body = { text(repo.host .. " · " .. repo.owner .. "/" .. repo.name, "strong") }
+	local actions = { button("关闭", "history_close") }
+	local rows = history.rows
+	if history.error then
+		table.insert(body, text(history.error, "warning"))
+	elseif not rows then
+		table.insert(body, text("正在读取本机历史…"))
+	elseif #rows == 0 then
+		table.insert(body, text("没有已记录的自动清理。历史功能加入前的清理不会补录。"))
+	else
+		local pages = math.ceil(#rows / CLEANUP_PAGE)
+		table.insert(body, text("共 " .. #rows .. " 条 · 第 " .. history.page .. " / " .. pages .. " 页 · 时间为 UTC"))
+		local first = (history.page - 1) * CLEANUP_PAGE + 1
+		for i = first, math.min(first + CLEANUP_PAGE - 1, #rows) do
+			local row = rows[i]
+			local kind = if row.kind == "issue" then "Issue" elseif row.kind == "review" then "审核 PR" else "开发 PR"
+			table.insert(body, text(kind .. " #" .. row.number .. " · " .. row.at, "strong"))
+			table.insert(body, text(row.branch .. " · " .. row.head:sub(1, 12)))
+		end
+		if pages > 1 then
+			table.insert(actions, button("上一页", "history_back", nil, history.page == 1))
+			table.insert(actions, button("下一页", "history_next", nil, history.page == pages))
+		end
+	end
+	return dialog("cleanup_history", "自动清理历史", body, actions)
 end
 
 local function repoLabel(repo: Repo): string
@@ -866,17 +1010,64 @@ local function browseToolbar(state: State, kind: string, filters: Filters, busy:
 		table.insert(shortcuts, { id = "preset=" .. index, label = preset.title, radio = "preset", checked = active })
 	end
 	local chips, count = filterSummary(kind, filters, busy)
-	local toolbar = wrapRow({
+	local controls = {
 		ui.button("搜标题", { key = "search", size = "sm", icon = "search", keys = { "/" }, disabled = busy,
 			actions = { click = "search" } }),
 		button(if count > 0 then "筛选 · " .. count else "筛选", "filters", state.filtersOpen, busy),
 		ui.node("menu", { key = "presets", text = "快捷筛选", caret = true, size = "sm", disabled = busy, items = shortcuts }),
-	}, "toolbar")
+	}
+	if kind == PR and not state.saved.reviewMode and filters.state == "MERGED" then
+		local scope, list = state.read, state.listing
+		table.insert(controls, button("批量清理…", "batch_cleanup", nil, busy or state.verifying or state.confirm ~= nil
+			or not scope or not scope.snapshot or not scope.snapshot.complete or not list or #list.data.rows == 0))
+	end
+	table.insert(controls, button("自动清理历史", "history_open", nil,
+		busy or state.verifying or state.confirm ~= nil or not state.read))
+	local toolbar = wrapRow(controls, "toolbar")
 	return ui.node("col", { key = "controls", gap = "xs" }, { toolbar, wrapRow(chips, "conditions") })
 end
 
 local function rowStatus(row: Row): string
 	return if row.state == "MERGED" then "已合并" elseif row.state ~= "OPEN" then "已关闭" elseif row.draft then "草稿" else "开放"
+end
+
+local function issueDetails(state: State, row: Row, linked: IssueLinks?, localState: string?, current: boolean): Node
+	local parts: {Node} = { text("#" .. row.number .. " 进度", "strong") }
+	local work, localName = state.issueWork, if localState then localIssueNames[localState] else nil
+	local observed = work and work.number == row.number and work.facts or nil
+	if localName then table.insert(parts, ui.badge(localName, "info")) end
+	if observed then
+		if observed.commits then table.insert(parts, ui.badge("有工作区提交", "info")) end
+		if observed.archived then table.insert(parts, ui.badge("已有工作区归档", "muted")) end
+		if observed.dirty then table.insert(parts, ui.badge("有未提交改动", "warning")) end
+		if observed.diverged then table.insert(parts, ui.badge("工作区 HEAD 已偏离起点", "warning")) end
+		if observed.unchecked then table.insert(parts, ui.badge("子模块内部改动未核对", "warning")) end
+		if observed.clean and not observed.dirty and not observed.unknown and not observed.unavailable and not observed.unchecked then
+			table.insert(parts, ui.badge("无未提交改动", "muted"))
+		end
+		if observed.unknown or observed.unavailable then table.insert(parts, ui.badge("有工作区状态不可核对", "warning")) end
+	elseif localName and work and work.number == row.number and not work.checked then
+		table.insert(parts, ui.badge("正在核对工作区…", "muted"))
+	elseif not localName and work and work.number == row.number and work.checked then
+		table.insert(parts, ui.badge("无本机任务记录", "muted"))
+	end
+	local remote = false
+	if linked then
+		for _, spec in linkedStates do
+			for _, ref in linked.groups[spec[1]] or {} do
+				remote = true
+				local mergedOpen = spec[1] == "merged" and row.state == "OPEN"
+				table.insert(parts, ui.badge("PR " .. ref .. " " .. (if mergedOpen then "已合并，Issue 未关闭" else spec[2]),
+					if mergedOpen then "warning" else spec[3]))
+			end
+		end
+	end
+	if not linked or not linked.complete or not current then
+		table.insert(parts, ui.badge("关联 PR 未完整核对", "muted"))
+	elseif not remote then
+		table.insert(parts, ui.badge("未发现明确关联 PR", "muted"))
+	end
+	return wrapRow(parts, "issue_progress")
 end
 
 local function listView(state: State, cx: BlockCx, repo: Repo, kind: string, filters: Filters, busy: boolean, current: boolean): Node
@@ -906,6 +1097,7 @@ local function listView(state: State, cx: BlockCx, repo: Repo, kind: string, fil
 	table.insert(master, wrapRow({ text("任务列表", "strong"),
 		ui.badge(syncStatus, if syncError then "warning" else "muted") }, "summary"))
 	if syncError then table.insert(master, text(syncError, "warning")) end
+	if scope and scope.autoCleaned then table.insert(master, text("本窗口已自动清理 " .. scope.autoCleaned .. " 个任务工作区。")) end
 	if data.uncertain > 0 then table.insert(master, text(data.uncertain .. " 项缺少筛选证据，无法确认是否匹配。", "warning")) end
 	if total == 0 then
 		local title = if current and data.uncertain == 0 then "没有匹配项" else "暂未找到匹配项"
@@ -925,7 +1117,12 @@ local function listView(state: State, cx: BlockCx, repo: Repo, kind: string, fil
 	for index = (page - 1) * PAGE + 1, math.min(page * PAGE, total) do
 		local row = data.rows[index]
 		local target = state.generation .. ":" .. row.number
-		local status = { ui.span(rowStatus(row), "muted") }
+		local linked = links and links[row.number]
+		local reason = linked and linked.reason
+		local statusLabel = if reason == "REOPENED" and row.state == "OPEN" then "重新开放"
+			elseif row.state == "CLOSED" and type(reason) == "string" and issueCloseReasons[reason] then "已关闭：" .. issueCloseReasons[reason]
+			else rowStatus(row)
+		local status = { ui.span(statusLabel, "muted") }
 		local function signal(label: string, tone: string)
 			table.insert(status, ui.span(" · " .. label, tone))
 		end
@@ -941,17 +1138,33 @@ local function listView(state: State, cx: BlockCx, repo: Repo, kind: string, fil
 			elseif row.review == "APPROVED" then signal("已批准", "success")
 			elseif row.review == "REVIEW_REQUIRED" then signal("需要审查", "info") end
 		else
-			if localBadge and localBadge(row.number) ~= "" then signal("本机处理中", "info") end
-			if links and links[row.number] then signal(links[row.number], "muted") end
+			if linked then
+				for _, spec in linkedStates do
+					local key, label, tone = spec[1], spec[2], spec[3]
+					local group = linked.groups[key]
+					if not group then continue end
+					local subject = if #group == 1 and group[1]:sub(1, 1) == "#" then "PR " .. group[1] else #group .. " 个 PR"
+					local mergedOpen = key == "merged" and row.state == "OPEN"
+					signal(subject .. " " .. (if mergedOpen then "已合并，Issue 未关闭" else label), if mergedOpen then "warning" else tone)
+				end
+			end
+			local localName = if localBadge then localIssueNames[localBadge(row.number)] else nil
+			if localName then signal(localName, "info") end
 		end
 		table.insert(rows, ui.node("item", { key = "n" .. row.number, title = row.title,
 			label = { ui.span("#" .. row.number .. "  ", "mono muted"), ui.span(row.title) },
 			value = status, disabled = disabled,
-			actions = { click = "open=" .. target, menu = if not state.saved.reviewMode and kind == PR and row.state == "OPEN"
-				then { { id = "push_command=" .. target, label = "复制推送命令", disabled = state.confirm ~= nil } } else nil } }))
+			actions = { click = "open=" .. target, menu = if not state.saved.reviewMode and kind == PR then
+				(if row.state == "OPEN" then { { id = "push_command=" .. target, label = "复制推送命令", disabled = state.confirm ~= nil } }
+				elseif row.state == "MERGED" then { { id = "cleanup_preview=" .. target, label = "清理本地工作区…", disabled = state.confirm ~= nil } }
+				else nil) else nil } }))
 	end
 	table.insert(master, ui.node("list", { key = "results", selected = RESULTS .. ".n" .. selected.number,
-		max = { lines = math.clamp(cx.rows - 12, 3, PAGE) }, filter = filters.title }, rows))
+		max = { lines = math.clamp(cx.rows - (if kind == ISSUE then 14 else 12), 3, PAGE) }, filter = filters.title }, rows))
+	if kind == ISSUE then
+		table.insert(master, issueDetails(state, selected, links and links[selected.number],
+			if localBadge then localBadge(selected.number) else nil, current))
+	end
 
 	return column()
 end
@@ -979,6 +1192,7 @@ local function view(state: State, cx: BlockCx): BlockView
 	local main, dock = { header(state, busy) }, taskDock(state, busy)
 	local layer: Node? = nil
 	if edit and edit.key == "checkout" then layer = editorView(edit, "选择本地 checkout") end
+	if repo and state.history then layer = historyView(repo, state.history) end
 	if not repo then
 		if state.discovery then
 			table.insert(main, ui.progress(nil, "正在识别 Git remote 和 fork 上游…"))
@@ -1046,6 +1260,8 @@ local function view(state: State, cx: BlockCx): BlockView
 	if edit and edit.key ~= "checkout" then
 		local field = fieldFor(state, edit.key)
 		layer = editorView(edit, if field then field.title else "筛选")
+	elseif state.cleanup then
+		layer = cleanupView(state.cleanup)
 	elseif not layer then
 		if state.filtersOpen then layer = filtersView(state, kind, filters) end
 	end
@@ -1071,6 +1287,14 @@ local block: BlockDef<State> = {
 	view = view,
 	key = function(state, key, cx)
 		if state.opening then return false end
+		if state.history then
+			if key.name == "escape" then state.history = nil; return true end
+			return false
+		end
+		if state.cleanup then
+			if key.name == "escape" then state.cleanup = nil; return true end
+			return false
+		end
 		local panel = state.panel
 		if panel then
 			local controller = panel.controller
@@ -1097,12 +1321,12 @@ local block: BlockDef<State> = {
 			if state.repo then reload(state, cx, true, true) elseif state.source ~= "" then discover(state, cx, state.source) end
 		elseif key.name == "tab" and not state.saved.reviewMode then setKind(state, cx, if state.saved.kind == ISSUE then PR else ISSUE)
 		elseif key.text == "/" and state.repo then search(state, cx, state.repo)
-		elseif key.name == "up" then navigation(state, -1)
-		elseif key.name == "down" then navigation(state, 1)
+		elseif key.name == "up" then navigation(state, cx, -1)
+		elseif key.name == "down" then navigation(state, cx, 1)
 		elseif list and (key.name == "left" or key.name == "right") then
-			selectAdjacentPage(state, list, pageAt(list) + (if key.name == "left" then -1 else 1))
-		elseif key.name == "page_up" then navigation(state, -PAGE)
-		elseif key.name == "page_down" then navigation(state, PAGE)
+			selectAdjacentPage(state, cx, list, pageAt(list) + (if key.name == "left" then -1 else 1))
+		elseif key.name == "page_up" then navigation(state, cx, -PAGE)
+		elseif key.name == "page_down" then navigation(state, cx, PAGE)
 		elseif key.name == "enter" and list and list.data.rows[list.position] then
 			openRow(state, cx, list.data.rows[list.position].number)
 		else return false end
@@ -1113,6 +1337,55 @@ local block: BlockDef<State> = {
 			cx:frame({ { "focus", EDIT_INPUT } }); return
 		end
 		if state.opening then return end
+		local history = state.history
+		if history then
+			if ev.ev ~= "action" then return end
+			if ev.act == "history_close" then state.history = nil
+			elseif history.rows and (ev.act == "history_back" or ev.act == "history_next") then
+				history.page = math.clamp(history.page + (if ev.act == "history_back" then -1 else 1),
+					1, math.max(1, math.ceil(#history.rows / CLEANUP_PAGE)))
+			end
+			return
+		end
+		local cleanup = state.cleanup
+		if cleanup then
+			if ev.ev ~= "action" then return end
+			if ev.act == "cleanup_cancel" then state.cleanup = nil; return end
+			if ev.act == "cleanup_back" or ev.act == "cleanup_next" then
+				cleanup.page = math.clamp(cleanup.page + (if ev.act == "cleanup_back" then -1 else 1), 1, math.ceil(#cleanup.entries / CLEANUP_PAGE))
+				return
+			end
+			if ev.act ~= "cleanup_run" or type(ev.value) ~= "string" then return end
+			local serial, position = ev.value:match("^(%d+):(%d+)$")
+			if tonumber(serial) ~= cleanup.serial or cleanup.cleaned ~= nil then return end
+			if cleanup.batch then
+				if tonumber(position) ~= 0 then return end
+				local scope = state.read
+				state.cleanup = nil
+				state.opening, state.taskError, state.progress = cleanup.entries[1].request.number, nil, "正在逐项重新核对并清理…"
+				sessions.cleanBatch(runtime.exec, cleanup.entries, function(results, cleaned)
+					state.opening = nil
+					if not runtime.alive(cx.pane) or state.read ~= scope then return end
+					state.progress = "已清理 " .. cleaned .. " 项；未清理 " .. (#results - cleaned) .. " 项。"
+					state.cleanup = { entries = results, serial = cleanup.serial, page = 1, batch = true, cleaned = cleaned }
+					cx:render()
+				end)
+				return
+			end
+			local entry = cleanup.entries[tonumber(position) or 0]
+			local target = entry and entry.target
+			if not entry or not target or entry.problem then return end
+			local request = entry.request
+			state.cleanup = nil
+			state.opening, state.taskError, state.progress = request.number, nil, "正在重新核对并清理所选工作区…"
+			sessions.cleanPR(runtime.exec, request, target, function(message, err)
+				state.opening = nil
+				if not runtime.alive(cx.pane) then return end
+				state.progress, state.taskError = message, err
+				cx:render()
+			end)
+			return
+		end
 		local panel = state.panel
 		local browsing = not panel and not state.edit and not state.filtersOpen
 		local action, value
@@ -1136,11 +1409,15 @@ local block: BlockDef<State> = {
 			return
 		else return end
 		if type(action) ~= "string" then return end
-		if action == "return_to_list" then checkFocusedList(state, cx); return end
+		if action == "return_to_list" then
+			refreshIssueWork(state, cx, true)
+			checkFocusedList(state, cx)
+			return
+		end
 		if action == "page" then
 			local page, list = tonumber(value), state.listing
 			if browsing and list and page then
-				selectAdjacentPage(state, list, page)
+				selectAdjacentPage(state, cx, list, page)
 			end
 			return
 		end
@@ -1186,9 +1463,46 @@ local block: BlockDef<State> = {
 			return
 		end
 		if not repo then return end
+		if action == "history_open" then
+			local scope, checkout = state.read, state.saved.checkout
+			if not browsing or state.verifying or state.confirm or not scope or not checkout then return end
+			local opened: History = { page = 1 }
+			state.history = opened
+			sessions.cleanupHistory(runtime.exec, { repo = repo, identity = scope.identity, checkout = checkout,
+				kind = PR, number = 0, pane = cx.pane }, function(rows, err)
+				if state.history ~= opened or state.read ~= scope or not runtime.alive(cx.pane) then return end
+				opened.rows, opened.error = rows, if rows then nil else err or "无法读取自动清理历史。"
+				cx:render()
+			end)
+			return
+		end
 		if action == "new_issue" and browsing and not state.saved.reviewMode then setMode(state, cx, "submit"); return end
 		if action == "search" and browsing then search(state, cx, repo); return end
-		if action == "push_command" then
+		if action == "batch_cleanup" then
+			local scope, checkout = state.read, state.saved.checkout
+			if not browsing or state.saved.reviewMode or state.verifying or state.confirm or state.saved.kind ~= PR
+				or not checkout or not scope or not scope.snapshot or not scope.snapshot.complete or not list
+				or pref(state, repo).filters.state ~= "MERGED" then return end
+			local numbers: {number} = {}
+			for _, row in list.data.rows do if row.state == "MERGED" then table.insert(numbers, row.number) end end
+			local first = numbers[1]
+			if not first then return end
+			local request: sessions.Request = { repo = repo, identity = scope.identity, checkout = checkout, kind = PR,
+				number = first, pane = cx.pane }
+			state.opening, state.taskError, state.progress = first, nil, "正在预览匹配的已合并 PR…"
+			sessions.cleanupBatchPreview(runtime.exec, request, numbers, function(entries, err)
+				state.opening = nil
+				if not runtime.alive(cx.pane) or state.read ~= scope then return end
+				state.progress, state.taskError = nil, err
+				if entries then
+					state.generation += 1
+					state.cleanup = { entries = entries, serial = state.generation, page = 1, batch = true }
+				end
+				cx:render()
+			end)
+			return
+		end
+		if action == "push_command" or action == "cleanup_preview" then
 			local checkout, scope = state.saved.checkout, state.read
 			if not browsing or not scope or state.saved.reviewMode or state.verifying or state.confirm or state.saved.kind ~= PR or not list or not checkout
 				or type(value) ~= "string" then return end
@@ -1196,7 +1510,27 @@ local block: BlockDef<State> = {
 			if tonumber(generation) ~= state.generation or not number then return end
 			local selected: Row? = nil
 			for _, row in list.data.rows do if row.number == tonumber(number) then selected = row; break end end
-			if not selected or selected.state ~= "OPEN" then return end
+			if not selected then return end
+			if action == "cleanup_preview" then
+				if selected.state ~= "MERGED" then return end
+				local request: sessions.Request = { repo = repo, identity = scope.identity, checkout = checkout, kind = PR,
+					number = selected.number, pane = cx.pane }
+				state.opening, state.taskError, state.progress = selected.number, nil, "正在核对已合并 PR 的本机工作区…"
+				sessions.cleanupPreview(runtime.exec, request, function(targets, err)
+					state.opening = nil
+					if not runtime.alive(cx.pane) or state.read ~= scope then return end
+					state.progress, state.taskError = nil, err
+					if targets then
+						state.generation += 1
+						local entries: {sessions.CleanupEntry} = {}
+						for _, target in targets do table.insert(entries, { request = request, target = target, problem = target.problem }) end
+						state.cleanup = { entries = entries, serial = state.generation, page = 1 }
+					end
+					cx:render()
+				end)
+				return
+			end
+			if selected.state ~= "OPEN" then return end
 			state.opening, state.confirm, state.taskError, state.progress = selected.number, nil, nil, "正在只读核对 PR 推送目标…"
 			sessions.pushCommand(runtime.exec, repo, scope.identity, checkout, selected.number, function(command, target, err)
 				state.opening = nil

@@ -52,7 +52,13 @@ local modules = {
             end
         end,
     },
-    ["./sessions"]={issueBadges=function() return function() return "" end end},
+    ["./sessions"]={
+        issueBadges=function() return function() return "" end end,
+        autoCleanup=function(_, _, snapshot, alive, done)
+            assert(snapshot.complete and alive())
+            done(0)
+        end,
+    },
     ["./maintenance_data"]={
         identity=function(_, done) table.insert(fixture.identities, done) end,
         cached=function(_, _, done)

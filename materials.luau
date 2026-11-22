@@ -34,10 +34,12 @@ local TASK_QUERY = "query(" .. TASK_VARS .. ") { viewer { id } repository(owner:
 local ISSUE = TASK_QUERY .. "issue(number: $number) { " .. TASK_FIELDS .. " } } }"
 local PR = TASK_QUERY .. "pullRequest(number: $number) { " .. TASK_FIELDS .. VERSION_FIELDS .. " mergeable reviewDecision } } }"
 local REVISION = TASK_QUERY .. "pullRequest(number: $number) { __typename id number url headRefOid baseRefOid baseRefName } } }"
+local MERGED_HEAD = TASK_QUERY .. "pullRequest(number: $number) { __typename id number url state headRefOid } } }"
 local PUSH_TARGET = TASK_QUERY .. "pullRequest(number: $number) { __typename id number url state headRefOid headRefName headRepository { nameWithOwner } } }"
 local DISCUSSION = "query($id: ID!, $cursor: String) { node(id: $id) { ... on Issue { id comments(first: 50, after: $cursor) { " .. PAGE .. " nodes { " .. COMMENT_FIELDS .. " } } } } }"
+local PR_DISCUSSION = "query($id: ID!, $cursor: String) { node(id: $id) { ... on PullRequest { id headRefOid comments(first: 50, after: $cursor) { " .. PAGE .. " nodes { " .. COMMENT_FIELDS .. " } } } } }"
 local THREADS = "query($id: ID!, $cursor: String) { node(id: $id) { ... on PullRequest { id headRefOid reviewThreads(first: 100, after: $cursor) { " .. PAGE .. " nodes { id isResolved } } } } }"
-local OVERALL_REVIEWS = "query($id: ID!, $cursor: String) { node(id: $id) { ... on PullRequest { id headRefOid latestReviews(first: 50, after: $cursor) { " .. PAGE .. " nodes { id url author { login __typename } state submittedAt commit { oid } body } } } } }"
+local OVERALL_REVIEWS = "query($id: ID!, $cursor: String) { node(id: $id) { ... on PullRequest { id headRefOid reviews(first: 50, after: $cursor, states: [APPROVED, CHANGES_REQUESTED, COMMENTED, DISMISSED]) { " .. PAGE .. " nodes { id url author { login __typename } state submittedAt commit { oid } body } } } } }"
 local REPLIES = "query($id: ID!, $cursor: String) { node(id: $id) { ... on PullRequestReviewThread { " .. THREAD_FIELDS .. [[
 	pullRequest { id headRefOid }
 	comments(first: 50, after: $cursor) { ]] .. PAGE .. " nodes { " .. COMMENT_FIELDS .. [[
@@ -261,6 +263,34 @@ function materials.revision(exec: runtime.Exec, repo: runtime.Repo, account: Ide
 	end)
 end
 
+function materials.mergedHead(exec: runtime.Exec, repo: runtime.Repo, account: Identity, number: number, done: (string?, string?) -> ())
+	if not validTarget(repo, number) then done(nil, "PR 任务身份无效。"); return end
+	graphql(exec, repo, MERGED_HEAD, taskFields(repo, number), function(data, err)
+		if err then done(nil, err.message); return end
+		if not authorized(data, account) then done(nil, "仓库或登录账号已变化；请刷新任务列表。"); return end
+		local identity, task = actual(repo, "pr", number, data)
+		if not identity or task.state ~= "MERGED" then done(nil, "只能清理已在线核对为合并状态的 PR。"); return end
+		local head = sha(task.headRefOid)
+		if not head then done(nil, "无法核对已合并 PR 的 head SHA。"); return end
+		done(head, nil)
+	end)
+end
+
+function materials.closedPRHead(exec: runtime.Exec, repo: runtime.Repo, account: Identity, number: number,
+	done: (string?, string?) -> ())
+	if not validTarget(repo, number) then done(nil, "PR 任务身份无效。"); return end
+	graphql(exec, repo, MERGED_HEAD, taskFields(repo, number), function(data, err)
+		if err then done(nil, err.message); return end
+		if not authorized(data, account) then done(nil, "仓库或登录账号已变化。"); return end
+		local identity, task = actual(repo, "pr", number, data)
+		if not identity or (task.state ~= "CLOSED" and task.state ~= "MERGED") then
+			done(nil, "PR 不再处于终态。"); return
+		end
+		local value = sha(task.headRefOid)
+		done(value, if value then nil else "无法核对已关闭 PR 的 head。")
+	end)
+end
+
 function materials.pushTarget(exec: runtime.Exec, repo: runtime.Repo, account: Identity, number: number,
 	done: (string?, string?, string?, string?) -> ())
 	if not validTarget(repo, number) then done(nil, nil, nil, "PR 身份无效。"); return end
@@ -330,18 +360,64 @@ local function walk(fetch: (string?, Callback) -> (), visit: (any) -> Problem?, 
 	page(nil)
 end
 
-local function discussion(exec: runtime.Exec, repo: runtime.Repo, id: string, done: Callback)
+local CLOSED_ISSUE_LINKS = "query(" .. TASK_VARS .. ", $cursor: String) { viewer { id } repository(owner: $owner, name: $name) {"
+	.. " id nameWithOwner issue(number: $number) { __typename id number url state closedByPullRequestsReferences"
+	.. "(first: 50, after: $cursor, includeClosedPrs: true) { " .. PAGE .. " nodes { id state headRefOid repository { id } } } } } }"
+
+function materials.closedIssueMergedHeads(exec: runtime.Exec, repo: runtime.Repo, account: Identity, number: number,
+	done: ({string}?, string?) -> ())
+	if not validTarget(repo, number) then done(nil, "Issue 任务身份无效。"); return end
+	local heads: {string} = {}
+	local issueId: string? = nil
+	local changed = problem("unverified", "无法核对已关闭 Issue 或其关联 PR。")
+	walk(function(cursor, receive)
+		graphql(exec, repo, CLOSED_ISSUE_LINKS, withCursor(taskFields(repo, number), cursor), function(data, err)
+			if err then receive(nil, err); return end
+			if not authorized(data, account) then receive(nil, changed); return end
+			local issue, task = actual(repo, "issue", number, data)
+			if not issue or (issueId and issueId ~= issue.id) or task.state ~= "CLOSED" then
+				receive(nil, changed); return
+			end
+			issueId = issue.id
+			receive(task.closedByPullRequestsReferences, nil)
+		end)
+	end, function(pr)
+		if type(pr.repository) ~= "table" or not text(pr.repository.id)
+			or (pr.state ~= "OPEN" and pr.state ~= "CLOSED" and pr.state ~= "MERGED") then return changed end
+		if pr.repository.id == account.repoId and pr.state == "MERGED" then
+			local head = sha(pr.headRefOid)
+			if not head then return changed end
+			table.insert(heads, head)
+		end
+		return nil
+	end, function(err)
+		done(if err then nil else heads, if err then err.message else nil)
+	end)
+end
+
+local function discussion(exec: runtime.Exec, repo: runtime.Repo, id: string, head: string?, done: Callback)
 	local comments: { any } = tern.json.array()
 	walk(function(cursor, receive)
-		graphql(exec, repo, DISCUSSION, withCursor({ "-f", "id=" .. id }, cursor), function(data, err)
+		graphql(exec, repo, if head then PR_DISCUSSION else DISCUSSION, withCursor({ "-f", "id=" .. id }, cursor), function(data, err)
+			if err then receive(nil, err); return end
 			local node = data and data.node
-			receive(if type(node) == "table" and node.id == id then node.comments else nil, err)
+			if type(node) ~= "table" or node.id ~= id then
+				receive(nil, problem("unknown", "无法核对 GitHub 讨论归属。")); return
+			end
+			if head and sha(node.headRefOid) ~= head then
+				receive(nil, problem("unverified", "未能把 PR 讨论对应到任务 head。")); return
+			end
+			receive(node.comments, nil)
 		end)
 	end, function(comment)
 		table.insert(comments, comment)
 		return nil
 	end, function(err)
-		done(if err then nil else comments, err)
+		if head then
+			done({ comments = comments, complete = err == nil, error = if err then err.message else nil }, nil)
+		else
+			done(if err then nil else comments, err)
+		end
 	end)
 end
 
@@ -414,10 +490,11 @@ local function overallReviews(exec: runtime.Exec, repo: runtime.Repo, prId: stri
 			if type(node) ~= "table" or node.id ~= prId or sha(node.headRefOid) ~= head then
 				receive(nil, problem("unverified", "未能把整体审查对应到任务 head。")); return
 			end
-			receive(node.latestReviews, nil)
+			receive(node.reviews, nil)
 		end)
 	end, function(review)
-		if review.state == "CHANGES_REQUESTED" or review.state == "APPROVED" then
+		if review.state == "CHANGES_REQUESTED" or review.state == "APPROVED"
+			or ((review.state == "COMMENTED" or review.state == "DISMISSED") and text(review.body)) then
 			review.onCurrentHead = type(review.commit) == "table" and sha(review.commit.oid) == head
 			table.insert(evidence.reviews, review)
 		end
@@ -809,8 +886,8 @@ local function enrichFailures(exec: runtime.Exec, repo: runtime.Repo, v: Version
 	load(1)
 end
 
-function materials.collect(exec: runtime.Exec, repo: runtime.Repo, account: Identity, kind: string, number: number,
-	expected: PRRevision?, alive: () -> boolean, done: (data: any, error: string?) -> ())
+local function collect(exec: runtime.Exec, repo: runtime.Repo, account: Identity, kind: string, number: number,
+	expected: PRRevision?, alive: () -> boolean, done: (data: any, error: string?) -> (), commentsOnly: boolean?)
 	if (kind ~= "issue" and kind ~= "pr") or not validTarget(repo, number) then
 		done(nil, "GitHub 任务身份无效。")
 		return
@@ -846,7 +923,7 @@ function materials.collect(exec: runtime.Exec, repo: runtime.Repo, account: Iden
 			author = task.author, createdAt = task.createdAt, updatedAt = task.updatedAt,
 		}
 		if taskKind == "issue" then
-			discussion(activeExec, repo, identity.id, function(comments, discussionError)
+			discussion(activeExec, repo, identity.id, nil, function(comments, discussionError)
 				if discussionError then finish(nil, "读取 Issue 讨论：" .. discussionError.message); return end
 				material.discussion = comments
 				finish(material, nil)
@@ -867,14 +944,14 @@ function materials.collect(exec: runtime.Exec, repo: runtime.Repo, account: Iden
 			head = head, base = revision.baseSHA, baseRef = revision.baseRef,
 		}
 		local version = versionFor(task, head)
-		overallReviews(activeExec, repo, identity.id, head, task.reviewDecision, function(overall, _reviewError)
-			material.overallReviews = overall
-			reviewThreads(activeExec, repo, identity.id, head, function(threads, reviewError)
-				if reviewError then finish(nil, reviewError.message); return end
-				material.reviewThreads = threads
-				exactChecks(activeExec, repo, number, head, function(ci, checks)
-					material.ci = ci
-					enrichFailures(activeExec, repo, version, checks, ci, function()
+		discussion(activeExec, repo, identity.id, head, function(comments)
+			material.discussion = comments
+			overallReviews(activeExec, repo, identity.id, head, task.reviewDecision, function(overall)
+				material.overallReviews = overall
+				reviewThreads(activeExec, repo, identity.id, head, function(threads, reviewError)
+					if reviewError then finish(nil, reviewError.message); return end
+					material.reviewThreads = threads
+					local function verifySnapshot()
 						readRevision(activeExec, repo, account, number, function(current, versionError, id)
 							if versionError then finish(nil, "复核 PR 版本：" .. versionError); return end
 							if not current or current.head ~= head or id ~= identity.id
@@ -884,11 +961,26 @@ function materials.collect(exec: runtime.Exec, repo: runtime.Repo, account: Iden
 							end
 							finish(material, nil)
 						end)
-					end)
+					end
+					if commentsOnly then
+						verifySnapshot()
+					else
+						exactChecks(activeExec, repo, number, head, function(ci, checks)
+							material.ci = ci
+							enrichFailures(activeExec, repo, version, checks, ci, verifySnapshot)
+						end)
+					end
 				end)
 			end)
 		end)
 	end)
+end
+
+materials.collect = collect
+
+function materials.collectComments(exec: runtime.Exec, repo: runtime.Repo, account: Identity, number: number,
+	expected: PRRevision, alive: () -> boolean, done: (data: any, error: string?) -> ())
+	collect(exec, repo, account, "pr", number, expected, alive, done, true)
 end
 
 return materials
