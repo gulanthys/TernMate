@@ -1,3 +1,7 @@
 [data-surface="plugin.ternmate.workbench"] [data-id="main.header.identity"] {
 	min-width: min(100%, 200px);
 }
+
+[data-surface="plugin.ternmate.workbench"] [data-id="main.workspace.master.results"] {
+	overflow: clip;
+}

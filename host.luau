@@ -755,13 +755,19 @@ local function editorKey(edit: Editor, key: Key): boolean
 	return true
 end
 
-local function pageAt(list: Listing): number
-	return math.ceil(math.max(1, list.position) / PAGE)
+local function pageSize(state: State, cx: BlockCx): number
+	-- Reserve room for the header, filters, footer, and Issue details.
+	return math.clamp(math.floor((cx.rows - (if kindFor(state) == ISSUE then 16 else 13)) / 2), 1, PAGE)
+end
+
+local function pageAt(list: Listing, size: number): number
+	return math.ceil(math.max(1, list.position) / size)
 end
 
 local function selectAdjacentPage(state: State, cx: BlockCx, list: Listing, page: number)
-	if page >= 1 and math.abs(page - pageAt(list)) == 1 then
-		choosePosition(state, (page - 1) * PAGE + 1)
+	local size = pageSize(state, cx)
+	if page >= 1 and (page - 1) * size < #list.data.rows and math.abs(page - pageAt(list, size)) == 1 then
+		choosePosition(state, (page - 1) * size + 1)
 		refreshIssueWork(state, cx)
 	end
 end
@@ -1112,9 +1118,10 @@ local function listView(state: State, cx: BlockCx, repo: Repo, kind: string, fil
 	local disabled = busy or state.verifying
 	local localBadge = if kind == ISSUE and scope and state.saved.checkout then sessions.issueBadges(repo, scope.identity, state.saved.checkout) else nil
 	local links = if kind == ISSUE and scope then scope.links else nil
-	local page = pageAt(list)
+	local size = pageSize(state, cx)
+	local page = pageAt(list, size)
 	local rows: { Node } = {}
-	for index = (page - 1) * PAGE + 1, math.min(page * PAGE, total) do
+	for index = (page - 1) * size + 1, math.min(page * size, total) do
 		local row = data.rows[index]
 		local target = state.generation .. ":" .. row.number
 		local linked = links and links[row.number]
@@ -1160,7 +1167,7 @@ local function listView(state: State, cx: BlockCx, repo: Repo, kind: string, fil
 				else nil) else nil } }))
 	end
 	table.insert(master, ui.node("list", { key = "results", selected = RESULTS .. ".n" .. selected.number,
-		max = { lines = math.clamp(cx.rows - (if kind == ISSUE then 14 else 12), 3, PAGE) }, filter = filters.title }, rows))
+		filter = filters.title }, rows))
 	if kind == ISSUE then
 		table.insert(master, issueDetails(state, selected, links and links[selected.number],
 			if localBadge then localBadge(selected.number) else nil, current))
@@ -1231,14 +1238,15 @@ local function view(state: State, cx: BlockCx): BlockView
 	table.insert(main, ui.node("col", { key = "workspace" }, { listView(state, cx, repo, kind, filters, busy, current) }))
 	local list = state.listing
 	if list and #list.data.rows > 0 then
-		local page = pageAt(list)
+		local size = pageSize(state, cx)
+		local page = pageAt(list, size)
 		local total = #list.data.rows
 		local complete = current and list.data.uncertain == 0
 		local controls = ui.row({
 			ui.button("‹", { key = "prev", title = "上一页", size = "sm", disabled = busy or page == 1,
 				actions = { click = "page=" .. (page - 1) } }),
 			ui.node("text", { key = "current", aria = "第 " .. page .. " 页", spans = { ui.span(tostring(page), "mono strong") } }),
-			ui.button("›", { key = "next", title = "下一页", size = "sm", disabled = busy or page * PAGE >= total,
+			ui.button("›", { key = "next", title = "下一页", size = "sm", disabled = busy or page * size >= total,
 				actions = { click = "page=" .. (page + 1) } }),
 		})
 		table.insert(dock, ui.node("row", { key = "pager", justify = "end", gap = "sm", wrap = true }, {
@@ -1324,9 +1332,9 @@ local block: BlockDef<State> = {
 		elseif key.name == "up" then navigation(state, cx, -1)
 		elseif key.name == "down" then navigation(state, cx, 1)
 		elseif list and (key.name == "left" or key.name == "right") then
-			selectAdjacentPage(state, cx, list, pageAt(list) + (if key.name == "left" then -1 else 1))
-		elseif key.name == "page_up" then navigation(state, cx, -PAGE)
-		elseif key.name == "page_down" then navigation(state, cx, PAGE)
+			selectAdjacentPage(state, cx, list, pageAt(list, pageSize(state, cx)) + (if key.name == "left" then -1 else 1))
+		elseif key.name == "page_up" then navigation(state, cx, -pageSize(state, cx))
+		elseif key.name == "page_down" then navigation(state, cx, pageSize(state, cx))
 		elseif key.name == "enter" and list and list.data.rows[list.position] then
 			openRow(state, cx, list.data.rows[list.position].number)
 		else return false end
