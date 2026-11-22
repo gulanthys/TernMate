@@ -756,8 +756,14 @@ local function editorKey(edit: Editor, key: Key): boolean
 end
 
 local function pageSize(state: State, cx: BlockCx): number
-	-- Reserve room for the header, filters, footer, and Issue details.
-	return math.clamp(math.floor((cx.rows - (if kindFor(state) == ISSUE then 16 else 13)) / 2), 1, PAGE)
+	-- Each native item takes roughly two terminal rows. Reserve space for
+	-- the toolbar and dock, including extra lines for transient notices.
+	local scope, list = state.read, state.listing
+	local reserved = if kindFor(state) == ISSUE then 10 else 9
+	if state.progress or state.taskError or state.confirm then reserved += 2 end
+	if scope and (scope.error or scope.revisionError or scope.autoCleaned) then reserved += 2 end
+	if list and list.data.uncertain > 0 then reserved += 1 end
+	return math.clamp(math.floor((cx.rows - reserved) / 2), 1, PAGE)
 end
 
 local function pageAt(list: Listing, size: number): number
@@ -1076,7 +1082,8 @@ local function issueDetails(state: State, row: Row, linked: IssueLinks?, localSt
 	return wrapRow(parts, "issue_progress")
 end
 
-local function listView(state: State, cx: BlockCx, repo: Repo, kind: string, filters: Filters, busy: boolean, current: boolean): Node
+local function listView(state: State, cx: BlockCx, repo: Repo, kind: string, filters: Filters, busy: boolean, current: boolean,
+	dock: { Node }): Node
 	local list, scope = state.listing, state.read
 	local master: { Node } = {}
 	local function column(): Node
@@ -1087,7 +1094,7 @@ local function listView(state: State, cx: BlockCx, repo: Repo, kind: string, fil
 		if err then
 			table.insert(master, ui.node("empty", { title = "任务列表不可用", text = err, tone = "error" }))
 		else
-			table.insert(master, ui.progress(nil, if state.verifying then "正在核对 GitHub 仓库和账号…"
+			table.insert(dock, ui.progress(nil, if state.verifying then "正在核对 GitHub 仓库和账号…"
 				elseif scope and scope.hydrated then "正在同步 GitHub 列表…" else "正在读取本地镜像…"))
 		end
 		return column()
@@ -1100,11 +1107,10 @@ local function listView(state: State, cx: BlockCx, repo: Repo, kind: string, fil
 		elseif scope and scope.checkingRevision then "正在核对本地提交结果"
 		elseif syncError then "同步未确认 · 显示已知数据"
 		elseif current then "本地镜像 · 已同步" else "本地镜像 · 覆盖未确认"
-	table.insert(master, wrapRow({ text("任务列表", "strong"),
-		ui.badge(syncStatus, if syncError then "warning" else "muted") }, "summary"))
-	if syncError then table.insert(master, text(syncError, "warning")) end
-	if scope and scope.autoCleaned then table.insert(master, text("本窗口已自动清理 " .. scope.autoCleaned .. " 个任务工作区。")) end
-	if data.uncertain > 0 then table.insert(master, text(data.uncertain .. " 项缺少筛选证据，无法确认是否匹配。", "warning")) end
+	table.insert(dock, ui.badge(syncStatus, if syncError then "warning" else "muted"))
+	if syncError then table.insert(dock, text(syncError, "warning")) end
+	if scope and scope.autoCleaned then table.insert(dock, text("本窗口已自动清理 " .. scope.autoCleaned .. " 个任务工作区。")) end
+	if data.uncertain > 0 then table.insert(dock, text(data.uncertain .. " 项缺少筛选证据，无法确认是否匹配。", "warning")) end
 	if total == 0 then
 		local title = if current and data.uncertain == 0 then "没有匹配项" else "暂未找到匹配项"
 		local hint = if not current then "列表覆盖尚未确认。" elseif data.uncertain > 0 then "部分任务仍缺少筛选证据。" else "调整筛选条件，查看其他任务。"
@@ -1169,7 +1175,7 @@ local function listView(state: State, cx: BlockCx, repo: Repo, kind: string, fil
 	table.insert(master, ui.node("list", { key = "results", selected = RESULTS .. ".n" .. selected.number,
 		filter = filters.title }, rows))
 	if kind == ISSUE then
-		table.insert(master, issueDetails(state, selected, links and links[selected.number],
+		table.insert(dock, issueDetails(state, selected, links and links[selected.number],
 			if localBadge then localBadge(selected.number) else nil, current))
 	end
 
@@ -1202,7 +1208,7 @@ local function view(state: State, cx: BlockCx): BlockView
 	if repo and state.history then layer = historyView(repo, state.history) end
 	if not repo then
 		if state.discovery then
-			table.insert(main, ui.progress(nil, "正在识别 Git remote 和 fork 上游…"))
+			table.insert(dock, ui.progress(nil, "正在识别 Git remote 和 fork 上游…"))
 		elseif state.scopeError then
 			table.insert(main, ui.node("empty", { title = "无法打开仓库", text = state.scopeError, tone = "error" }))
 		elseif #state.repos > 0 then
@@ -1213,7 +1219,7 @@ local function view(state: State, cx: BlockCx): BlockView
 			table.insert(main, text("选择此 checkout 对应的任务仓库。"))
 			table.insert(main, wrapRow(choices))
 		end
-		return { main = ui.col(main), layer = layer }
+		return { main = ui.col(main), dock = ui.col(dock), layer = layer }
 	end
 
 	if panel then
@@ -1235,7 +1241,7 @@ local function view(state: State, cx: BlockCx): BlockView
 		table.insert(main, kindTabs(state, current))
 	end
 	table.insert(main, browseToolbar(state, kind, filters, busy))
-	table.insert(main, ui.node("col", { key = "workspace" }, { listView(state, cx, repo, kind, filters, busy, current) }))
+	table.insert(main, ui.node("col", { key = "workspace" }, { listView(state, cx, repo, kind, filters, busy, current, dock) }))
 	local list = state.listing
 	if list and #list.data.rows > 0 then
 		local size = pageSize(state, cx)
@@ -1253,17 +1259,6 @@ local function view(state: State, cx: BlockCx): BlockView
 			controls,
 			text((if complete then "共 " else "已找到 ") .. total .. " 项"),
 		}))
-	end
-	if not state.confirm and not busy then
-		local spans = { ui.span("↑ ↓", "key"), ui.span(" 选择   ", "muted"),
-			ui.span("← →", "key"), ui.span(" 翻页   ", "muted"),
-			ui.span("Enter", "key"), ui.span(if state.saved.reviewMode then " 只读审核" else " 打开   ", "muted") }
-		if not state.saved.reviewMode then
-			table.insert(spans, ui.span("Tab", "key"))
-			table.insert(spans, ui.span(" 切换 Issue / PR", "muted"))
-		end
-		local footer = { ui.node("text", { key = "shortcuts", spans = spans }) }
-		table.insert(dock, ui.node("row", { key = "browse_footer", gap = "sm", justify = "between", wrap = true }, footer))
 	end
 	if edit and edit.key ~= "checkout" then
 		local field = fieldFor(state, edit.key)
