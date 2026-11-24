@@ -1204,6 +1204,9 @@ local function listView(state: State, cx: BlockCx, repo: Repo, kind: string, fil
 			table.insert(status, ui.span(" · " .. label, tone))
 		end
 		if kind == PR then
+			if row.issues and #row.issues > 0 then signal("Issue " .. table.concat(row.issues, ", "), "info") end
+			if row.issuesComplete ~= true then signal("关联 Issue 未完整核对", "muted")
+			elseif not row.issues or #row.issues == 0 then signal("未发现明确关联 Issue", "muted") end
 			if row.mergeable == "CONFLICTING" then signal("合并冲突", "warning")
 			elseif row.mergeable == "UNKNOWN" then signal("可合并性未知", "muted") end
 			if row.ci ~= "none" then

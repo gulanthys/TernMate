@@ -690,6 +690,37 @@ fixture.liveReads[1].done({pr(1, "live row after scan failure")})
 assert(fixture.state.read and shows("live row after scan failure") and not shows("共 1 项"))
 print("PR polling, focus refresh, warm-cache freshness, cancellation, and backoff passed.")
 
+local function issueRef(repository, number)
+    return {id=repository .. ":" .. number, number=number, url="https://github.com/" .. repository .. "/issues/" .. number}
+end
+for _, review in {false, true} do
+    for _, scenario in {
+        {refs={nodes={issueRef("org/repo", 7)}, totalCount=1, pageInfo={hasNextPage=false}}, label="Issue #7"},
+        {refs={nodes={issueRef("org/repo", 7), issueRef("other/repo", 7)}, totalCount=2,
+            pageInfo={hasNextPage=false}}, label="Issue #7, other/repo#7"},
+        {refs={nodes={}, totalCount=0, pageInfo={hasNextPage=false}}, label="未发现明确关联 Issue", empty=true},
+        {label="关联 Issue 未完整核对"},
+        {refs={nodes={issueRef("org/repo", 7)}, totalCount=2, pageInfo={hasNextPage=true}},
+            label="Issue #7", partial=true},
+        {refs={nodes={}, totalCount=1, pageInfo={hasNextPage=false}}, label="关联 Issue 未完整核对"},
+        {refs={nodes={{id="bad", number=7, url="https://github.com/org/repo/issues/8"}},
+            totalCount=1, pageInfo={hasNextPage=false}}, label="关联 Issue 未完整核对"},
+    } do
+        start(); respond(1, a)
+        local snapshot = complete({})
+        local item = pr(3, "Linked PR")
+        item.url, item.closingIssuesReferences = "https://github.com/org/repo/pull/3", scenario.refs
+        snapshot.prs = {item}
+        fixture.scans[1].done(snapshot)
+        assert(block.key(fixture.state, {name="tab"}, cx))
+        if review then block.event(fixture.state, {ev="select",id="main.header.modes",item="review"}, cx) end
+        assert(shows(scenario.label), scenario.label)
+        assert(shows("未发现明确关联 Issue") == (scenario.empty == true))
+        if scenario.partial then assert(shows("关联 Issue 未完整核对")) end
+    end
+end
+print("Development and review PR rows distinguish linked Issues, cross-repository numbers, empty links, and incomplete evidence.")
+
 print("Issue draft identity, approved visibility, failed sync, and post-create refresh passed.")
 LUAU
 } > "$root/test.luau"

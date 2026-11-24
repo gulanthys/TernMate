@@ -7,7 +7,7 @@ export type Filters = { [string]: string }
 export type Row = {
 	number: number, title: string, state: string, author: string, url: string,
 	draft: boolean, base: string?, requested: boolean, threads: boolean, ci: string,
-	mergeable: string?, review: string?,
+	mergeable: string?, review: string?, issues: {string}?, issuesComplete: boolean?,
 }
 
 local github = {}
@@ -108,6 +108,40 @@ local function unresolved(entry: any): boolean
 	return entry.isResolved == false
 end
 
+local function issueReferences(item: any): ({string}, boolean)
+	local labels = {}
+	local refs = item.closingIssuesReferences
+	if type(refs) ~= "table" or type(refs.nodes) ~= "table" then return labels, false end
+	local complete = type(refs.pageInfo) == "table" and refs.pageInfo.hasNextPage == false
+		and type(refs.totalCount) == "number" and #refs.nodes == refs.totalCount
+	local source, sourceHost
+	if type(item.url) == "string" then source, sourceHost = item.url:match("^(https://([^/]+)/[^/]+/[^/]+)/pull/%d+$") end
+	source = if source then source:lower() else nil
+	sourceHost = if sourceHost then sourceHost:lower() else nil
+	local seen: {[string]: boolean} = {}
+	for _, issue in refs.nodes do
+		local number = if type(issue) == "table" then issue.number else nil
+		local url = if type(issue) == "table" then issue.url else nil
+		local root, host, owner, name, urlNumber
+		if type(url) == "string" then
+			host, owner, name, urlNumber = url:match("^https://([^/]+)/([^/]+)/([^/]+)/issues/(%d+)$")
+			if host then root = "https://" .. host .. "/" .. owner .. "/" .. name end
+		end
+		if type(number) ~= "number" or number < 1 or number % 1 ~= 0 or tonumber(urlNumber) ~= number
+			or not root or not host or not owner or not name then
+			complete = false
+			continue
+		end
+		local key = root:lower() .. "#" .. number
+		if seen[key] then complete = false; continue end
+		seen[key] = true
+		local label = if source == root:lower() then "#" .. number else owner .. "/" .. name .. "#" .. number
+		if sourceHost and host:lower() ~= sourceHost then label = host .. "/" .. label end
+		table.insert(labels, label)
+	end
+	return labels, complete
+end
+
 function github.project(snapshot: any, kind: string, filters: Filters): ({ Row }, number)
 	local pr = kind == "pr"
 	local viewer = snapshot.viewer:lower()
@@ -179,6 +213,7 @@ function github.project(snapshot: any, kind: string, filters: Filters): ({ Row }
 			requested = requested == true, threads = threads == true, ci = ci,
 			mergeable = mergeable, review = if pr and type(item.reviewDecision) == "string" then item.reviewDecision else nil,
 		}
+		if pr then row.issues, row.issuesComplete = issueReferences(item) end
 		table.insert(rows, row)
 	end
 	table.sort(rows, function(a, b)
