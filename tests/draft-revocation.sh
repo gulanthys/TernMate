@@ -705,11 +705,16 @@ for _, review in {false, true} do
         {refs={nodes={}, totalCount=1, pageInfo={hasNextPage=false}}, label="关联 Issue 未完整核对"},
         {refs={nodes={{id="bad", number=7, url="https://github.com/org/repo/issues/8"}},
             totalCount=1, pageInfo={hasNextPage=false}}, label="关联 Issue 未完整核对"},
+        {refs={nodes={},totalCount=0,pageInfo={hasNextPage=false}},
+            body={nodes={issueRef("org/repo",522)},complete=true}, label="Issue #522"},
+        {refs={nodes={issueRef("org/repo",7)},totalCount=1,pageInfo={hasNextPage=false}},
+            body={nodes={issueRef("org/repo",7)},complete=true}, label="Issue #7", dedup=true},
     } do
         start(); respond(1, a)
         local snapshot = complete({})
         local item = pr(3, "Linked PR")
         item.url, item.closingIssuesReferences = "https://github.com/org/repo/pull/3", scenario.refs
+        item.bodyIssueReferences = scenario.body or {nodes={},complete=true}
         snapshot.prs = {item}
         fixture.scans[1].done(snapshot)
         assert(block.key(fixture.state, {name="tab"}, cx))
@@ -717,6 +722,7 @@ for _, review in {false, true} do
         assert(shows(scenario.label), scenario.label)
         assert(shows("未发现明确关联 Issue") == (scenario.empty == true))
         if scenario.partial then assert(shows("关联 Issue 未完整核对")) end
+        if scenario.dedup then assert(#fixture.state.listing.data.rows[1].issues == 1) end
     end
 end
 print("Development and review PR rows distinguish linked Issues, cross-repository numbers, empty links, and incomplete evidence.")

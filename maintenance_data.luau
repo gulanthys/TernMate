@@ -32,9 +32,9 @@ local issue: Kind = {
 }
 local pr: Kind = {
 	name = "pullRequests", typename = "PullRequest",
-	scalars = prIndex .. " isCrossRepository mergeable "
+	scalars = prIndex .. " isCrossRepository mergeable bodyHTML "
 		.. "commits(last:1){nodes{commit{oid statusCheckRollup{state contexts(first:1){totalCount}}}}}",
-	keys = {"headRefOid", "baseRefName", "isCrossRepository", "isDraft", "mergeable", "reviewDecision", "commits"},
+	keys = {"headRefOid", "baseRefName", "isCrossRepository", "isDraft", "mergeable", "reviewDecision", "commits", "bodyIssueReferences"},
 	nested = {
 		{name = "labels", first = 30, fields = "id name"},
 		{name = "closingIssuesReferences", first = 25, fields = "id number url"},
@@ -211,6 +211,14 @@ local function indexItems(kind: Kind, items: any): {[string]: any}?
 			if not connection(value) or value.pageInfo.hasNextPage or #value.nodes ~= value.totalCount then return nil end
 			if not acceptChildren(spec, value.nodes, true, {}) then return nil end
 		end
+		if kind == pr and item.bodyIssueReferences ~= nil then
+			local refs = item.bodyIssueReferences
+			if type(refs) ~= "table" or type(refs.nodes) ~= "table" or type(refs.complete) ~= "boolean" then return nil end
+			for _, node in refs.nodes do
+				if type(node) ~= "table" or type(node.number) ~= "number" or node.number < 1 or node.number % 1 ~= 0
+					or type(node.url) ~= "string" then return nil end
+			end
+		end
 		indexed[item.id] = item
 		numbers[item.number] = true
 		count += 1
@@ -269,7 +277,8 @@ function data.cached(repo: Repo, identity: Identity, done: Callback)
 		if not sameScope(repo, identity, value) then done(nil, "本地镜像不完整或身份不符。"); return end
 		if value.repoUrl ~= identity.webUrl then done(nil, nil); return end
 		local cachedIssues = indexItems(issue, value.issues)
-		if not cachedIssues or not indexItems(pr, value.prs) then
+		local cachedPrs = indexItems(pr, value.prs)
+		if not cachedIssues or not cachedPrs then
 			done(nil, "本地镜像不完整。"); return
 		end
 		value.viewer = identity.viewer -- Login can change; the cache key cannot.
@@ -291,6 +300,9 @@ function data.cached(repo: Repo, identity: Identity, done: Callback)
 		if confirmed ~= revision then value.checkedEpoch = nil end
 		for _, item in cachedIssues do
 			if not item.closedByPullRequestsReferences then value.checkedEpoch = nil; break end
+		end
+		for _, item in cachedPrs do
+			if not item.bodyIssueReferences then value.checkedEpoch = nil; break end
 		end
 		done(value, nil)
 	end)
@@ -351,10 +363,38 @@ local function pageError(kind: Kind, current: any, detail: boolean, covered: num
 	return nil
 end
 
+local function bodyIssueReferences(html: any): any
+	local refs = {nodes = {}, complete = type(html) == "string"}
+	if type(html) ~= "string" then return refs end
+	local seen: {[string]: boolean} = {}
+	for attributes in html:gmatch("<a%s+([^>]-)>") do
+		local values: {[string]: string} = {}
+		for key, quote, value in attributes:gmatch("([%w_-]+)%s*=%s*(['\"])(.-)%2") do
+			values[key] = value
+		end
+		-- GitHub's rendered links distinguish Issues from PRs even for plain
+		-- “关联 #522”. Do not infer types from “#number” or data-url (PRs use /issues/ there too).
+		if values["data-hovercard-type"] ~= "issue" then continue end
+		local url = values.href
+		local number = if url then tonumber(url:match("^https://[^/]+/[^/]+/[^/]+/issues/(%d+)$")) else nil
+		if not number or number < 1 then refs.complete = false; continue end
+		if not seen[url] then
+			seen[url] = true
+			table.insert(refs.nodes, {number = number, url = url})
+		end
+	end
+	return refs
+end
+
 local function expand(identity: Identity, request: (string, {[string]: any}, (any) -> ()) -> (),
 	fail: (string) -> (), alive: () -> boolean, kind: Kind, items: {any}, detail: boolean, ready: () -> ())
 	local jobs: {{item: any, spec: Nested, seen: {[string]: boolean}}} = {}
 	for _, item in items do
+		if kind == pr then
+			-- Persist only the resolved Issue identifiers, never the PR body.
+			item.bodyIssueReferences = bodyIssueReferences(item.bodyHTML)
+			item.bodyHTML = nil
+		end
 		for _, spec in kind.nested do
 			local part = item[spec.name]
 			local seen: {[string]: boolean} = {}
@@ -566,6 +606,7 @@ local function syncScope(repo: Repo, identity: Identity, scope: string, revision
 			for position, entry in inventory do
 				local prior = old and old[entry.id]
 				if not prior or not sameIndex(entry, prior) or (kind == issue and not prior.closedByPullRequestsReferences)
+					or (kind == pr and not prior.bodyIssueReferences)
 					or (lastVisible and visible and visible[entry.id] ~= prior) then
 					table.insert(changed, position)
 				else

@@ -50,6 +50,8 @@ local function row(number, old)
 		headRefOid = 'head', baseRefName = 'main', isDraft = false, isCrossRepository = false, mergeable = 'MERGEABLE',
 		author = {login = 'author'}, reviewDecision = 'APPROVED',
 		commits = {nodes = {{commit = {oid = 'head', statusCheckRollup = {state = if old then 'PENDING' else 'SUCCESS', contexts = {totalCount = 4}}}}}}}
+	item.bodyHTML = if number == 1 then '<p>拆自 <a data-hovercard-type="pull_request" href="https://github.test/owner/repo/pull/1241" data-url="https://github.test/owner/repo/issues/1241">#1241</a>，关联 <a data-hovercard-type="issue" href="https://github.test/owner/repo/issues/522">#522</a></p>' else ""
+	if old then item.bodyIssueReferences = {nodes={}, complete=true}; item.bodyHTML = nil end
 	for _, spec in specs do
 		item[spec] = if not old and (number == 2 or number == 101) then connection({child(spec, 1)}, spec .. ':cursor', 2) else connection({})
 	end
@@ -174,6 +176,9 @@ local function scenario(options)
 		local current = indexed['pr:1']
 		assert(current.updatedAt == prior.prs[1].updatedAt and current.headRefOid == prior.prs[1].headRefOid)
 		assert(current.commits.nodes[1].commit.statusCheckRollup.state == 'SUCCESS', 'CI-only changes must not use the cached row')
+		assert(current.bodyHTML == nil and current.bodyIssueReferences.complete)
+		assert(#current.bodyIssueReferences.nodes == 1 and current.bodyIssueReferences.nodes[1].number == 522,
+			'plain related Issue links are included, but a split-from PR link is not an Issue')
 		for _, number in (if options.cold then {2} else {2, 101}) do
 			for _, spec in specs do
 				local part = indexed['pr:' .. number][spec]

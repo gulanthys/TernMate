@@ -110,34 +110,39 @@ end
 
 local function issueReferences(item: any): ({string}, boolean)
 	local labels = {}
-	local refs = item.closingIssuesReferences
-	if type(refs) ~= "table" or type(refs.nodes) ~= "table" then return labels, false end
-	local complete = type(refs.pageInfo) == "table" and refs.pageInfo.hasNextPage == false
-		and type(refs.totalCount) == "number" and #refs.nodes == refs.totalCount
+	local closing, body = item.closingIssuesReferences, item.bodyIssueReferences
+	local complete = type(closing) == "table" and type(closing.nodes) == "table"
+		and type(closing.pageInfo) == "table" and closing.pageInfo.hasNextPage == false
+		and type(closing.totalCount) == "number" and #closing.nodes == closing.totalCount
+		and type(body) == "table" and type(body.nodes) == "table" and body.complete == true
 	local source, sourceHost
 	if type(item.url) == "string" then source, sourceHost = item.url:match("^(https://([^/]+)/[^/]+/[^/]+)/pull/%d+$") end
 	source = if source then source:lower() else nil
 	sourceHost = if sourceHost then sourceHost:lower() else nil
 	local seen: {[string]: boolean} = {}
-	for _, issue in refs.nodes do
-		local number = if type(issue) == "table" then issue.number else nil
-		local url = if type(issue) == "table" then issue.url else nil
-		local root, host, owner, name, urlNumber
-		if type(url) == "string" then
-			host, owner, name, urlNumber = url:match("^https://([^/]+)/([^/]+)/([^/]+)/issues/(%d+)$")
-			if host then root = "https://" .. host .. "/" .. owner .. "/" .. name end
+	for group = 1, 2 do
+		local refs = if group == 1 then closing else body
+		if type(refs) ~= "table" or type(refs.nodes) ~= "table" then continue end
+		for _, issue in refs.nodes do
+			local number = if type(issue) == "table" then issue.number else nil
+			local url = if type(issue) == "table" then issue.url else nil
+			local root, host, owner, name, urlNumber
+			if type(url) == "string" then
+				host, owner, name, urlNumber = url:match("^https://([^/]+)/([^/]+)/([^/]+)/issues/(%d+)$")
+				if host then root = "https://" .. host .. "/" .. owner .. "/" .. name end
+			end
+			if type(number) ~= "number" or number < 1 or number % 1 ~= 0 or tonumber(urlNumber) ~= number
+				or not root or not host or not owner or not name then
+				complete = false
+				continue
+			end
+			local key = root:lower() .. "#" .. number
+			if seen[key] then continue end
+			seen[key] = true
+			local label = if source == root:lower() then "#" .. number else owner .. "/" .. name .. "#" .. number
+			if sourceHost and host:lower() ~= sourceHost then label = host .. "/" .. label end
+			table.insert(labels, label)
 		end
-		if type(number) ~= "number" or number < 1 or number % 1 ~= 0 or tonumber(urlNumber) ~= number
-			or not root or not host or not owner or not name then
-			complete = false
-			continue
-		end
-		local key = root:lower() .. "#" .. number
-		if seen[key] then complete = false; continue end
-		seen[key] = true
-		local label = if source == root:lower() then "#" .. number else owner .. "/" .. name .. "#" .. number
-		if sourceHost and host:lower() ~= sourceHost then label = host .. "/" .. label end
-		table.insert(labels, label)
 	end
 	return labels, complete
 end

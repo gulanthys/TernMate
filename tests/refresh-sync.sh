@@ -48,6 +48,8 @@ local function item(kind, number, old, detail)
 	if kind == 'issues' and number == linkedIssue then row.state = 'OPEN' end
 	if kind == 'prs' then
 		row.headRefOid, row.baseRefName, row.isDraft = 'head', 'main', false
+		row.bodyHTML = ""
+		if old then row.bodyIssueReferences = {nodes={}, complete=true}; row.bodyHTML = nil end
 	end
 	if detail then
 		row.title, row.url = prefix .. row.id, identity.webUrl .. '/' .. kind .. '/' .. number
