@@ -20,7 +20,7 @@ type Done = (string?, string?, Notice?) -> ()
 type Record = {
 	dir: string, program: string, subject: string, phase: string, file: string?, pane: number?, launchingUntil: number?,
 	launchAttempt: { pane: number? }?,
-	revision: Version?,
+	revision: Version?, splitBoundary: boolean?,
 }
 type Index = { latest: string?, records: { [string]: Record } }
 type Snapshot = { window: string, view: any }
@@ -436,7 +436,7 @@ local function sessionCwd(request: Request, record: Record): string
 	return if request.review then record.dir else workCwd(record)
 end
 
-local function taskBoundary(request: Request, record: Record): string
+local function taskBoundary(request: Request, record: Record, legacySingleIssue: boolean?): string
 	local issue = request.kind == ISSUE
 	local revision = record.revision
 	local cwd = workCwd(record)
@@ -451,12 +451,28 @@ local function taskBoundary(request: Request, record: Record): string
 	elseif issue then
 		boundary ..= 'No remote mutations unless the interactive user explicitly authorizes the exact target and action. '
 		boundary ..= 'Issue activation authorizes read-only analysis only. Do not modify files, commits, or repository state unless the interactive user explicitly requests a fix. '
-			.. 'If the user authorizes a fix, make changes only in this task worktree. Do not edit or switch the source checkout. '
+			.. (if legacySingleIssue then 'If the user authorizes a fix, make changes only in this task worktree. Do not edit or switch the source checkout. '
+				else 'If the user authorizes a fix, modify this task worktree or the explicitly authorized split worktrees described below. Do not edit or switch the source checkout. ')
 	else
 		boundary ..= 'No remote mutations: do not push, reply, resolve, approve, merge, close, or rerun CI unless the interactive user explicitly authorizes the exact target and action. '
 		boundary ..= 'PR baseline: ' .. tostring(revision and revision.head) .. '. Local edits and targeted verification are allowed only in this independent worktree; preserve all existing work and do not switch, reset, or overwrite it. '
 			.. 'The worktree is not a sandbox. Do not execute scripts, binaries, project tooling, hooks, builds, tests or dependencies from this external PR until the interactive user confirms trust, or in an explicitly authorized isolated environment without host credentials. '
 			.. 'Only version-linked CI evidence supports conclusions about remote checks; local verification is not remote success. '
+	end
+	if not request.review and not legacySingleIssue then
+		boundary ..= 'One Issue may require multiple independent branches and PRs; do not force them into one branch or PR. '
+			.. 'When the interactive user explicitly requests splitting this task into fixes, additional authorized write roots are the new worktrees under '
+			.. record.dir .. '/fixes/. Preserve the original task worktree, branch, commits and uncommitted changes unless the user separately authorizes changing them. '
+			.. 'This is an explicit exception to the single-worktree write boundary above, not permission to write elsewhere. '
+			.. 'Create each split using this trusted helper argv, replacing only <name> and <base-sha>: '
+			.. tern.json.encode({ '/bin/sh', tern.plugin.dir .. '/session-setup.sh', 'split-worktree', record.dir,
+				request.checkout, request.kind, tostring(request.number), '<name>', '<base-sha>' }) .. '. '
+			.. 'The helper returns the exact worktree path, branch and base SHA. The name is 1-48 lowercase letters, digits, underscores or hyphens, starting with a letter or digit. '
+			.. 'Verify the intended target branch and pin its local commit before creating independent fixes; do not use the combined implementation tip as their base unless a dependent/stacked PR was explicitly requested. '
+			.. 'Port only the changes for each fix and commit separately in its returned worktree. Never reset, switch or overwrite the original to extract changes. '
+			.. 'Git metadata updates required to create these worktrees and commit on their branches are allowed; do not change shared Git configuration or unrelated refs. '
+			.. 'Split workspaces are retained and block automatic cleanup of this task. Report each branch, base, commit and intended PR separately. '
+			.. 'Creating local branches does not authorize a push or PR creation; remote mutations still require the interactive user to specify the exact target and action. '
 	end
 	if not issue then
 		boundary ..= 'Materials are a saved snapshot for this task revision, not live GitHub state. Do not apply them to a different head or review base. '
@@ -526,9 +542,12 @@ local function launchArgsMatch(argv: { string }, offset: number, request: Reques
 	for index, argument in ipairs(expected) do
 		local actual = argv[index + offset]
 		if actual ~= argument then
-			-- Older processes still belong to this exact task. Only their initial prompt may differ.
-			if file or index ~= #expected or request.kind == ISSUE
-				or actual ~= (if request.review then PREVIOUS_REVIEW else PREVIOUS_PR) then return false end
+			-- Recognize the exact pre-split Issue boundary only to focus the old
+			-- process and explain that it needs a normal exit/resume to upgrade.
+			local oldIssue = request.kind == ISSUE and not record.splitBoundary
+				and actual == '--append-system-prompt=' .. taskBoundary(request, record, true)
+			if not oldIssue and (file or index ~= #expected or request.kind == ISSUE
+				or actual ~= (if request.review then PREVIOUS_REVIEW else PREVIOUS_PR)) then return false end
 		end
 	end
 	return true, inbox
@@ -639,6 +658,7 @@ local cleanupProblems: {[number]: string} = {
 	[7] = '工作区含子模块；为避免执行其 Git 配置，未清理。',
 	[8] = '此工作区已移除。',
 	[9] = '工作区已移除，但无法安全删除任务分支；保留了分支、对象库及对话。',
+	[12] = '有拆分修复工作区；保留该任务及各分支，请分别核对其 PR 后处理。',
 }
 
 local function cleanupContext(exec: runtime.Exec, request: Request, done: (string?, string?, string?, string?) -> ())
@@ -988,9 +1008,12 @@ function sessions.issueWork(exec: runtime.Exec, repo: runtime.Repo, identity: Id
 		if not result or result.status ~= 0 or result.timed_out then done({unknown = true}); return end
 		local state: {[string]: boolean} = {}
 		local count = 0
-		for lineage, dirty in result.stdout:gmatch('([%a]+) ([%a]+)\n') do
+		for line in result.stdout:gmatch('[^\n]+') do
+			local lineage, dirty, extra = line:match('^(%a+) (%a+)(.*)$')
+			if not lineage or not dirty or (extra ~= '' and extra ~= ' split') then done({unknown = true}); return end
 			count += 1
 			state[lineage], state[dirty] = true, true
+			if extra == ' split' then state.split = true end
 		end
 		if count ~= (#argv - 3) / 2 then done({unknown = true}); return end
 		done(state)
@@ -1266,6 +1289,7 @@ local function openVerified(exec: runtime.Exec, request: Request, progress: (str
 						local function start(before: any)
 							record.phase, record.launchingUntil = 'launching', os.time() + LAUNCH_TIMEOUT + 8
 							record.launchAttempt = if fresh then {} else nil
+							record.splitBoundary = not request.review
 							if not persist() then return end
 							local argv = { tool, 'new', 'tab', paneId(source.session) }
 							for _, arg in ipairs({ '--json', '--window=' .. source.window, '--cwd', record.dir, '--keep-open', '--', record.program }) do
@@ -1493,6 +1517,9 @@ local function openVerified(exec: runtime.Exec, request: Request, progress: (str
 											focusOmp(window, pane.pane, function(focused)
 												if not focused then finish(nil, '不能聚焦原 omp 会话。'); return end
 												local function complete() opened(pane.pane, '已聚焦原 omp 会话。') end
+												if not request.review and not record.splitBoundary then
+													note ..= ' 此进程仍使用单工作区边界；请正常退出 omp 后再次打开此任务，恢复原对话并启用多分支修复。'
+												end
 												if not revision or request.retained then complete(); return end
 												if not inbox then
 													note ..= ' 此进程早于评论投递功能；正常退出后再次点击，即可恢复原对话并分析新增评论。'

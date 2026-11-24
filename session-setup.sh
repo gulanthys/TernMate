@@ -42,16 +42,29 @@ check_issue() (
         && safe_git -C "$wt" rev-parse --verify 'HEAD^{commit}'
 )
 
-saved_pr_store() {
+saved_pr_config() {
     private_dir "$task" && private_dir "$store" && { absent "$store/worktrees" || private_dir "$store/worktrees"; } \
         && regular "$store/config" && regular "$task/initial-git-config" \
         && cmp -s "$store/config" "$task/initial-git-config" \
-        && [ ! -e "$store/config.worktree" ] && [ ! -L "$store/config.worktree" ] \
-        && [ "$(safe_git --git-dir="$store" rev-parse --verify 'refs/ternmate/initial^{commit}')" = "$expected" ]
+        && absent "$store/config.worktree"
+}
+
+saved_pr_store() {
+    saved_pr_config && [ "$(safe_git --git-dir="$store" rev-parse --verify 'refs/ternmate/initial^{commit}')" = "$expected" ]
+}
+
+saved_pr_worktree() {
+    private_dir "$wt" && private_dir "$admin" && regular "$wt/.git" && regular "$admin/gitdir" \
+        && [ "$(cat "$wt/.git")" = "gitdir: $admin" ] && [ "$(cat "$admin/gitdir")" = "$wt/.git" ] \
+        && absent "$admin/config.worktree"
+}
+
+pr_worktree_paths() {
+    store=$task/store.git wt=$task/worktree admin=$task/store.git/worktrees/worktree
 }
 
 pr_cleanup_paths() {
-    store=$task/store.git wt=$task/worktree admin=$task/store.git/worktrees/worktree
+    pr_worktree_paths
     marker=$task/worktree-cleaned
     branch=ternmate/pr-$number-${task##*.}
     ref=refs/heads/$branch
@@ -59,6 +72,28 @@ pr_cleanup_paths() {
 }
 
 absent() { [ ! -e "$1" ] && [ ! -L "$1" ]; }
+
+fixes_empty() {
+    absent "$1/fixes" && return 0
+    private_dir "$1/fixes" || return 1
+    fixes_entries=$(CDPATH= cd -P "$1/fixes" && find . ! -name . -prune -print) || return 1
+    [ -z "$fixes_entries" ]
+}
+
+guard_cleanup_fixes() {
+    if ! fixes_empty "$task"; then
+        printf '%s\n' '任务包含拆分 worktree 或不安全的 fixes 目录；未清理。' >&2
+        exit 12
+    fi
+}
+
+lock_worktree_operation() {
+    # Serialize split creation with original-worktree removal for this task.
+    worktree_lock=$task/.worktree-operation
+    mkdir "$worktree_lock" 2>/dev/null || return 1
+    trap 'rmdir -- "$worktree_lock"' EXIT
+    trap 'exit 1' HUP INT TERM
+}
 
 clean_worktree() {
     for entry in index.lock locked MERGE_HEAD CHERRY_PICK_HEAD REVERT_HEAD rebase-apply rebase-merge sequencer BISECT_START; do
@@ -77,6 +112,16 @@ clean_worktree() {
 
 issue_filters_disabled() {
     if safe_git -C "$1" config --get-regexp '^filter\..*\.(process|clean|smudge)$' . >/dev/null; then
+        return 1
+    else
+        [ "$?" -eq 1 ]
+    fi
+}
+
+split_filters_disabled() {
+    # A conditional include can activate only in the new Git directory or
+    # on the new branch. Do not check out a split under unverified config.
+    if safe_git "$@" config --get-regexp '^(filter\..*\.(process|clean|smudge)|includeif\..*\.path)$' >/dev/null; then
         return 1
     else
         [ "$?" -eq 1 ]
@@ -370,6 +415,62 @@ case "$1" in
         if absent "$2/worktree" && regular "$2/worktree-cleaned"; then exit 6; fi
         check_issue "$2" "$3" >/dev/null
         ;;
+    split-worktree)
+        [ "$#" -eq 7 ] || fail '拆分 worktree 需要任务、checkout、类型、编号、名称及完整 base SHA。'
+        task=$2 checkout=$3 kind=$4 number=$5 slug=$6 base=$7
+        LC_ALL=C
+        export LC_ALL
+        case "$task" in /*/task-sessions-v2/task.*) ;; *) fail '无效的私有任务目录。' ;; esac
+        case "$task" in *[[:cntrl:]]*) fail '无效的私有任务目录。' ;; esac
+        suffix=${task##*/task.}
+        case "$suffix" in ''|*[!a-zA-Z0-9]*) fail '无效的私有任务目录。' ;; esac
+        private_dir "${task%/*}" && private_dir "$task" && [ "$(physical "$task")" = "$task" ] \
+            || fail '无效的私有任务目录。'
+        case "$kind" in issue|pr) ;; *) fail '无效的任务类型。' ;; esac
+        case "$number" in ''|0*|*[!0-9]*) fail '无效的任务编号。' ;; esac
+        case "$slug" in ''|[!a-z0-9]*|*[!a-z0-9_-]*) fail '无效的拆分名称。' ;; esac
+        [ "${#slug}" -le 48 ] || fail '无效的拆分名称。'
+        case "$base" in ''|*[!0-9A-Fa-f]*) fail 'base 必须是完整的提交 SHA。' ;; esac
+        [ "${#base}" -eq 40 ] || [ "${#base}" -eq 64 ] || fail 'base 必须是完整的提交 SHA。'
+        base=$(printf '%s' "$base" | tr 'A-F' 'a-f')
+
+        lock_worktree_operation || fail '无法锁定任务 worktree；请等待其他操作结束。'
+        wt=$task/worktree fixes=$task/fixes
+        dest=$fixes/$slug
+        source_ref=refs/heads/ternmate/$kind-$number-$suffix
+        split_branch=ternmate/$kind-$number-$suffix-$slug
+        if [ "$kind" = issue ]; then
+            check_issue "$task" "$checkout" >/dev/null 2>&1 \
+                || fail '无法核对 Issue 的原始 worktree 与所选 checkout。'
+            set -- -C "$checkout"
+        else
+            pr_worktree_paths
+            saved_pr_config && saved_pr_worktree \
+                && regular "$admin/commondir" && [ "$(cat "$admin/commondir")" = '../..' ] \
+                || fail '无法核对 PR 的私有 Git 存储、配置或原始 worktree。'
+            initial=$(safe_git --git-dir="$store" show-ref --verify --hash refs/ternmate/initial 2>/dev/null) \
+                && [ "$(safe_git --git-dir="$store" rev-parse --verify "$initial^{commit}" 2>/dev/null)" = "$initial" ] \
+                || fail '无法核对 PR 的初始提交引用。'
+            set -- --git-dir="$store"
+        fi
+        [ "$(safe_git -C "$wt" symbolic-ref --quiet HEAD 2>/dev/null)" = "$source_ref" ] \
+            && safe_git -C "$wt" rev-parse --verify 'HEAD^{commit}' >/dev/null 2>&1 \
+            || fail '原始 worktree 不在此任务的分支上。'
+        split_filters_disabled "$@" && split_filters_disabled -C "$wt" \
+            || fail 'Git 配置包含 filter 或条件包含，或无法核对配置；未拆分。'
+        absent "$fixes" || private_dir "$fixes" || fail '不安全的 fixes 目录。'
+        absent "$dest" || fail '拆分 worktree 路径已存在。'
+        if safe_git "$@" show-ref --verify --quiet "refs/heads/$split_branch"; then
+            fail '拆分分支已存在。'
+        elif [ "$?" -ne 1 ]; then
+            fail '无法核对拆分分支。'
+        fi
+        resolved=$(safe_git "$@" rev-parse --verify "$base^{commit}" 2>/dev/null) \
+            && [ "$resolved" = "$base" ] || fail 'base 不是 Git 存储中一个确切的现有提交。'
+        safe_git "$@" -c submodule.recurse=false worktree add --no-track \
+            -b "$split_branch" -- "$dest" "$resolved" >&2 || fail '无法创建拆分 worktree。'
+        printf '%s\n%s\n%s\n' "$dest" "$split_branch" "$resolved"
+        ;;
     cleanup-issue|restore-issue)
         operation=$1
         data=$(physical "$2") || exit 4
@@ -395,6 +496,8 @@ case "$1" in
             safe_git --git-dir="$store" update-ref -d "$archive" "$head"
             exit
         fi
+        lock_worktree_operation || exit 5
+        guard_cleanup_fixes
         if absent "$wt" && regular "$marker"; then exit 8; fi
         head=$(check_issue "$task" "$checkout") || exit 4
         [ "$(safe_git -C "$wt" symbolic-ref --quiet HEAD)" = "$ref" ] || exit 3
@@ -445,13 +548,15 @@ case "$1" in
             shift 2
             suffix=${task#"$data"/task-sessions-v2/task.}
             case "$suffix" in ''|*[!a-zA-Z0-9]*) printf 'unavailable unknown\n'; continue ;; esac
-            case "$base" in ''|*[!0-9a-f]*) printf 'unknown unknown\n'; continue ;; esac
+            split=
+            if private_dir "$data/task-sessions-v2" && private_dir "$task" && ! fixes_empty "$task"; then split=' split'; fi
+            case "$base" in ''|*[!0-9a-f]*) printf 'unknown unknown%s\n' "$split"; continue ;; esac
             if absent "$wt" && regular "$task/worktree-cleaned"; then
-                printf 'archived archived\n'
+                printf 'archived archived%s\n' "$split"
                 continue
             fi
             if ! head=$(check_issue "$task" "$checkout" 2>/dev/null); then
-                printf 'unavailable unknown\n'
+                printf 'unavailable unknown%s\n' "$split"
                 continue
             fi
             lineage=unknown
@@ -479,7 +584,7 @@ case "$1" in
                     fi
                 fi
             fi
-            printf '%s %s\n' "$lineage" "$dirty"
+            printf '%s %s%s\n' "$lineage" "$dirty" "$split"
         done
         [ "$#" -eq 0 ]
         ;;
@@ -543,13 +648,13 @@ case "$1" in
         case "$number" in ''|*[!0-9]*) exit 4 ;; esac
         case "$expected" in ''|*[!0-9a-f]*) exit 4 ;; esac
         [ "${#expected}" -eq 40 ] || exit 4
-        private_dir "$data/task-sessions-v2" || exit 4
+        private_dir "$data/task-sessions-v2" && private_dir "$task" || exit 4
+        if [ "$1" = cleanup-pr ]; then lock_worktree_operation || exit 5; fi
+        guard_cleanup_fixes
         pr_cleanup_paths
         if absent "$wt" && absent "$admin" && load_cleanup_marker && [ "$marker_saved" = "$saved" ]; then exit 8; fi
         saved_pr_store || exit 4
-        private_dir "$wt" && private_dir "$admin" && regular "$wt/.git" && regular "$admin/gitdir" \
-            && [ "$(cat "$wt/.git")" = "gitdir: $admin" ] && [ "$(cat "$admin/gitdir")" = "$wt/.git" ] \
-            && absent "$admin/config.worktree" || exit 4
+        saved_pr_worktree || exit 4
         [ "$(safe_git -C "$wt" symbolic-ref --quiet HEAD)" = "$ref" ] \
             && [ "$(safe_git -C "$wt" rev-parse --verify 'HEAD^{commit}')" = "$expected" ] || exit 3
         clean_worktree || exit "$?"

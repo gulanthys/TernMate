@@ -96,6 +96,14 @@ end, { repo = repo, identity = identity, checkout = '/checkout' }, {
 }, function() return true end, function(count) cleaned = count end)
 assert(cleaned == 0)
 print('An archived task index does not trigger cleanup checks.')
+
+local facts
+sessions.issueWork(function(argv, _, reply)
+	assert(argv[3] == 'issue-work' and argv[6] == newDir)
+	reply({status = 0, timed_out = false, stdout = 'commits clean split\n'})
+end, repo, identity, '/checkout', 7, function(value) facts = value end)
+assert(facts and facts.commits and facts.clean and facts.split and not facts.unknown)
+print('Issue evidence retains the split-workspace marker separately from original worktree cleanliness.')
 LUAU
 } > "$tmp/badges.luau"
 

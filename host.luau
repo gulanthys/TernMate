@@ -1051,11 +1051,12 @@ local function issueDetails(state: State, row: Row, linked: IssueLinks?, localSt
 	if localName then table.insert(parts, ui.badge(localName, "info")) end
 	if observed then
 		if observed.commits then table.insert(parts, ui.badge("有工作区提交", "info")) end
+		if observed.split then table.insert(parts, ui.badge("有拆分修复工作区 · 自动清理保留", "info")) end
 		if observed.archived then table.insert(parts, ui.badge("已有工作区归档", "muted")) end
 		if observed.dirty then table.insert(parts, ui.badge("有未提交改动", "warning")) end
 		if observed.diverged then table.insert(parts, ui.badge("工作区 HEAD 已偏离起点", "warning")) end
 		if observed.unchecked then table.insert(parts, ui.badge("子模块内部改动未核对", "warning")) end
-		if observed.clean and not observed.dirty and not observed.unknown and not observed.unavailable and not observed.unchecked then
+		if observed.clean and not observed.dirty and not observed.unknown and not observed.unavailable and not observed.unchecked and not observed.split then
 			table.insert(parts, ui.badge("无未提交改动", "muted"))
 		end
 		if observed.unknown or observed.unavailable then table.insert(parts, ui.badge("有工作区状态不可核对", "warning")) end

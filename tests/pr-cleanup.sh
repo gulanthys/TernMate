@@ -59,7 +59,7 @@ git -C "$wt" reset --hard -q "$head"
 scope=6769746875622e74657374-72-76
 other_scope=6769746875622e74657374-72-77
 [ "$(/bin/sh "$src/session-setup.sh" cleanup-history "$data" "$scope")" = end ]
-TERNMATE_CLEANUP_HISTORY=$scope TERNMATE_CLEANUP_MODE=review probe 0 cleanup-pr "$data" "$task" "$head" 7
+(TERNMATE_CLEANUP_HISTORY=$scope TERNMATE_CLEANUP_MODE=review probe 0 cleanup-pr "$data" "$task" "$head" 7)
 history=$(/bin/sh "$src/session-setup.sh" cleanup-history "$data" "$scope")
 [ "$(printf '%s\n' "$history" | cut -f2-)" = "$(printf 'review\t7\t%s\t%s\nend' "$branch" "$head")" ]
 [ "$(/bin/sh "$src/session-setup.sh" cleanup-history "$data" "$other_scope")" = end ]
@@ -81,7 +81,7 @@ marker=$task/worktree-cleaned
 interrupt_branch_delete() {
     # Permit worktree removal but stop Git at the branch deletion.
     touch "$store/$ref.lock"
-    TERNMATE_CLEANUP_HISTORY=$scope probe 9 cleanup-pr "$data" "$task" "$head" 7
+    (TERNMATE_CLEANUP_HISTORY=$scope probe 9 cleanup-pr "$data" "$task" "$head" 7)
     rm -- "$store/$ref.lock"
     [ ! -e "$wt" ] && [ -f "$marker" ]
     [ "$(git --git-dir="$store" rev-parse "$ref")" = "$head" ]
