@@ -24,6 +24,8 @@ type IssueWork = { number: number, checked: boolean?, facts: {[string]: boolean}
 type Scope = { identity: Identity, snapshot: any?, baseline: any?, checked: number?, loading: boolean?, hydrated: boolean?,
 	forceRefresh: boolean?, cancelSync: (() -> ())?,
 	checkingRevision: boolean?, revisionError: string?, focusPending: boolean?,
+	prTimer: TimerHandle?, prRequest: any?, prLoading: boolean?, prChecked: number?, prAttempted: number?,
+	prError: string?, prFailures: number?,
 	links: {[number]: IssueLinks}?,
 	issuesOpen: number?, prsOpen: number?, reviewOpen: number?,
 	timer: TimerHandle?, errors: number?, error: string?,
@@ -52,6 +54,7 @@ local EDIT_INPUT = "layer.editor.input"
 local WORKSPACE = "main.workspace"
 local RESULTS = WORKSPACE .. ".master.results"
 local SYNC_MS = 300_000
+local PR_SYNC_MS = 30_000
 local IDENTITY_CHANGED = "仓库或登录账号已变化；请刷新任务列表。"
 local states: { Choice } = { { "OPEN", "开放" }, { "CLOSED", "已关闭" } }
 local prStates: { Choice } = { { "OPEN", "开放" }, { "MERGED", "已合并" }, { "CLOSED", "关闭未合并" } }
@@ -139,6 +142,7 @@ local function invalidateScope(state: State, err: string?)
 	local previous = state.read
 	if previous and previous.timer then previous.timer:cancel() end
 	if previous and previous.cancelSync then previous.cancelSync() end
+	if previous and previous.prTimer then previous.prTimer:cancel() end
 	if state.issueWork and state.issueWork.timer then state.issueWork.timer:cancel() end
 	state.issueWork = nil
 	state.cleanup = nil
@@ -267,10 +271,60 @@ local function copyRows(rows: {any}): {any}
 	return table.move(rows, 1, #rows, 1, table.create(#rows))
 end
 
+local function refreshPRs(state: State, cx: BlockCx, repo: Repo, scope: Scope, eager: boolean?)
+	local function alive(): boolean return state.read == scope and state.repo == repo and runtime.alive(cx.pane) end
+	if not alive() or scope.loading or scope.prLoading then return end
+	local function schedule(delay: number)
+		if scope.prTimer then scope.prTimer:cancel() end
+		scope.prTimer = tern.timer(delay, function()
+			scope.prTimer = nil
+			if alive() then refreshPRs(state, cx, repo, scope, true) end
+		end)
+	end
+	local interval = PR_SYNC_MS * 2 ^ (scope.prFailures or 0)
+	if not eager or not scope.snapshot or kindFor(state) ~= PR or state.panel then schedule(interval); return end
+	local elapsed = if scope.prAttempted then tern.now() - scope.prAttempted else math.huge
+	local cooldown = if scope.prError then interval else 5_000
+	if elapsed < cooldown then schedule(cooldown - elapsed); return end
+	if scope.prTimer then scope.prTimer:cancel(); scope.prTimer = nil end
+	local request = {}
+	scope.prRequest, scope.prLoading, scope.prAttempted = request, true, tern.now()
+	local function active(): boolean return alive() and not scope.loading and scope.prRequest == request end
+	cx:render()
+	local previous = if scope.snapshot.complete then scope.snapshot else scope.baseline
+	maintenance.refreshPRs(repo, scope.identity, previous, active, function(rows, err, identityChanged)
+		if not active() then return end
+		scope.prLoading, scope.prRequest = false, nil
+		if identityChanged then invalidateScope(state, err or IDENTITY_CHANGED); cx:render(); return end
+		if rows then
+			local snapshot = table.clone(scope.snapshot)
+			local prs, positions = copyRows(snapshot.prs), {}
+			for i, pr in prs do positions[pr.id] = i end
+			for _, pr in rows do
+				local position = positions[pr.id] or (#prs + 1)
+				positions[pr.id], prs[position] = position, pr
+			end
+			-- This is an overlay, not a full mirror traversal or a persistence stamp.
+			snapshot.prs = prs
+			install(scope, snapshot)
+			scope.prChecked, scope.prFailures, scope.prError = tern.now(), 0, nil
+			project(state, cx, scope, true)
+		else
+			scope.prFailures = math.min(3, (scope.prFailures or 0) + 1)
+			scope.prError = err or "PR 轻量更新未完成。"
+		end
+		schedule(PR_SYNC_MS * 2 ^ (scope.prFailures or 0))
+		cx:render()
+	end)
+end
+
 local function synchronize(state: State, cx: BlockCx, repo: Repo, scope: Scope, forced: boolean?)
 	if forced then scope.forceRefresh = true end
 	if scope.loading then return end
 	scope.loading, scope.error, scope.revisionError = true, nil, nil
+	-- A full traversal supersedes any in-flight lightweight read.
+	scope.prRequest, scope.prLoading = nil, false
+	if scope.prTimer then scope.prTimer:cancel(); scope.prTimer = nil end
 	cx:render()
 	if scope.timer then scope.timer:cancel(); scope.timer = nil end
 	local function alive(): boolean return state.read == scope and state.repo == repo and runtime.alive(cx.pane) end
@@ -320,6 +374,7 @@ local function synchronize(state: State, cx: BlockCx, repo: Repo, scope: Scope, 
 				scope.baseline = snapshot
 				install(scope, snapshot)
 				scope.checked, scope.errors = tern.now(), 0
+				scope.prChecked, scope.prError, scope.prFailures = tern.now(), nil, 0
 				if changed or not state.listing then project(state, cx, scope, true) end
 				local checkout = state.saved.checkout
 				if not err and checkout and not scope.autoCleaning and not state.opening and not state.cleanup then
@@ -348,6 +403,7 @@ local function synchronize(state: State, cx: BlockCx, repo: Repo, scope: Scope, 
 			end
 			cx:render()
 			schedule(SYNC_MS * 2 ^ (scope.errors or 0))
+			refreshPRs(state, cx, repo, scope)
 		end, function(kind, updates)
 			if not active() then return end
 			if not preview then
@@ -392,6 +448,7 @@ local function synchronize(state: State, cx: BlockCx, repo: Repo, scope: Scope, 
 				scope.loading, scope.checked = false, tern.now() - age
 				cx:render()
 				schedule(SYNC_MS - age)
+				refreshPRs(state, cx, repo, scope, true)
 				return
 			end
 			sync()
@@ -454,6 +511,7 @@ local function checkFocusedList(state: State, cx: BlockCx)
 			return
 		end
 		cx:render()
+		refreshPRs(state, cx, repo, scope, true)
 	end)
 end
 
@@ -711,6 +769,7 @@ local function setKind(state: State, cx: BlockCx, kind: string)
 	state.field, state.progress, state.taskError, state.confirm = nil, nil, nil, nil
 	if state.edit then dismissEditor(state, cx) end
 	reload(state, cx, true)
+	if state.repo and state.read then refreshPRs(state, cx, state.repo, state.read, true) end
 end
 
 local function setReviewMode(state: State, cx: BlockCx, review: boolean)
@@ -718,6 +777,7 @@ local function setReviewMode(state: State, cx: BlockCx, review: boolean)
 	state.saved.reviewMode = review
 	state.field, state.progress, state.taskError, state.confirm = nil, nil, nil, nil
 	reload(state, cx, true)
+	if state.repo and state.read then refreshPRs(state, cx, state.repo, state.read, true) end
 end
 
 
@@ -1102,11 +1162,13 @@ local function listView(state: State, cx: BlockCx, repo: Repo, kind: string, fil
 	end
 	local data = list.data
 	local total = #data.rows
-	local syncError = scope and (scope.error or scope.revisionError)
+	local syncError = scope and (scope.error or scope.revisionError or (if kind == PR then scope.prError else nil))
 	local syncStatus = if state.verifying then "正在核对账号 · 显示上次列表"
 		elseif scope and scope.loading then "正在同步 · 已核对的条目会先更新"
 		elseif scope and scope.checkingRevision then "正在核对本地提交结果"
 		elseif syncError then "同步未确认 · 显示已知数据"
+		elseif kind == PR and scope and scope.prLoading then "正在更新开放 PR · 显示已知数据"
+		elseif kind == PR and scope and scope.prChecked then "开放 PR · 已在线核对"
 		elseif current then "本地镜像 · 已同步" else "本地镜像 · 覆盖未确认"
 	table.insert(master, wrapRow({ text("任务列表", "strong"),
 		ui.badge(syncStatus, if syncError then "warning" else "muted") }, "summary"))
@@ -1229,6 +1291,7 @@ local function view(state: State, cx: BlockCx): BlockView
 	local scope = state.read
 	local current = not state.verifying and scope ~= nil and scope.snapshot ~= nil and scope.snapshot.complete == true
 		and not scope.loading and not scope.error and not scope.checkingRevision and not scope.revisionError and fresh(scope.checked)
+		and (kind ~= PR or (not scope.prLoading and not scope.prError))
 	if state.saved.reviewMode then
 		local count = scope and scope.reviewOpen
 		local suffix = countLabel(scope, current, count)

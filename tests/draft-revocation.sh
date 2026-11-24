@@ -28,10 +28,12 @@ local ui = {
 }
 local tern = {ui=ui, json={encode=function(value) return value end, null={}},
     block={define=function(_, def) block=def end}}
-tern.now = function() return 400000 end
+tern.now = function() return fixture.clock end
 tern.timer = function(delay, callback)
-    if delay == 0 then callback() end
-    return {cancel=function() end}
+    local timer = {delay=delay, callback=callback, cancelled=false}
+    timer.cancel = function() timer.cancelled=true end
+    if delay == 0 then callback() else table.insert(fixture.timers, timer) end
+    return timer
 end
 local function partition(info)
     return info.repoId .. "/" .. info.viewerId
@@ -71,6 +73,9 @@ local modules = {
         sync=function(_, _, baseline, alive, done, progress, visible)
             table.insert(fixture.scans, {baseline=baseline, alive=alive, done=done, progress=progress, visible=visible})
             fixture.sync=done
+        end,
+        refreshPRs=function(_, _, snapshot, alive, done)
+            table.insert(fixture.liveReads, {snapshot=snapshot, alive=alive, done=done})
         end,
         createIssue=function(_, info, slot, draft, title, body, _, done)
             table.insert(fixture.sends, {scope=partition(info), slot=slot, draft=draft, title=title, body=body, visibility=info.visibility})
@@ -119,11 +124,11 @@ LUAU
     printf '%s\n' 'end)()'
     cat <<'LUAU'
 local cx = {pane=1, rows=30, render=function() end, frame=function() end}
-local function start(cache)
-    fixture = {cache=cache, scans={}, identities={}, queries={}, calls={}, sends={}, records={
+local function start(cache, kind)
+    fixture = {cache=cache, clock=400000, timers={}, liveReads={}, scans={}, identities={}, queries={}, calls={}, sends={}, records={
         [partition(a)]={[key]={title=secret, form="blank", version="main\ndir\n", fields={}}},
     }}
-    fixture.state = block.init(cx, {"/fixture"}, nil)
+    fixture.state = block.init(cx, {"/fixture"}, if kind then {kind=kind, filtersByRepo={}} else nil)
 end
 local function act(action, value)
     block.event(fixture.state, {ev="action", act=action, value=value}, cx)
@@ -609,6 +614,81 @@ for _, revised in {false, true} do
         assert(shows("共 1 项") and #fixture.scans == 0)
     end
 end
+
+-- PR updates do not wait for the next historical traversal or a changed local
+-- receipt. Both open rows and rows that just merged replace old evidence.
+local function pr(number, title, state, ci)
+    return {id="pr-" .. number, number=number, title=title, state=state or "OPEN", isDraft=false,
+        headRefOid="head", commits={nodes={{commit={oid="head",statusCheckRollup={state=ci or "SUCCESS"}}}}}}
+end
+local prMirror = complete({issue(1, "unchanged issue")})
+prMirror.prs = {pr(2, "old PR"), pr(1, "CI pending")}
+prMirror.resultRevision = "0"
+start()
+respond(1, a)
+fixture.scans[1].done(prMirror)
+local fullChecked = fixture.state.read.checked
+assert(block.key(fixture.state, {name="tab"}, cx))
+assert(#fixture.liveReads == 1 and #fixture.scans == 1)
+assert(block.key(fixture.state, {name="down"}, cx)) -- keep PR #1 selected
+fixture.liveReads[1].done({pr(3, "new remote PR"), pr(2, "merged PR", "MERGED"), pr(1, "CI failed", "OPEN", "FAILURE")})
+assert(shows("new remote PR") and shows("CI failed") and not shows("old PR"))
+assert(fixture.state.listing.data.rows[fixture.state.listing.position].number == 1)
+assert(prMirror.prs[1].state == "OPEN" and fixture.state.read.baseline == prMirror)
+assert(fixture.state.read.checked == fullChecked and not fixture.state.read.baseline.checkedEpoch)
+fixture.clock += 6000
+act("return_to_list")
+fixture.revisionReply("0")
+local live = fixture.liveReads[2]
+assert(live and live.alive() and #fixture.scans == 1, "unchanged local receipts cannot suppress a GitHub PR read")
+act("return_to_list"); fixture.revisionReply("0")
+assert(#fixture.liveReads == 2, "concurrent focus requests must coalesce")
+act("refresh")
+assert(not live.alive() and #fixture.scans == 2)
+live.done({pr(1, "stale PR callback")})
+assert(not shows("stale PR callback"))
+local latest = complete(prMirror.issues)
+latest.prs, latest.resultRevision = {pr(1, "full traversal result")}, "0"
+fixture.scans[2].done(latest)
+local timer = fixture.state.read.prTimer
+assert(timer and not timer.cancelled)
+fixture.clock += timer.delay
+timer.callback()
+assert(#fixture.liveReads == 3 and #fixture.scans == 2, "polling must not rescan Issue/PR history")
+fixture.liveReads[3].done(nil, "rate limited")
+assert(shows("full traversal result") and shows("rate limited"))
+local failedChecked = fixture.state.read.prChecked
+fixture.clock += 6000
+act("return_to_list"); fixture.revisionReply("0")
+assert(#fixture.liveReads == 3 and fixture.state.read.prChecked == failedChecked, "focus must respect error backoff")
+timer = fixture.state.read.prTimer
+fixture.clock += timer.delay
+timer.callback()
+assert(#fixture.liveReads == 4)
+fixture.liveReads[4].done(nil, "account changed", true)
+assert(not fixture.state.read and not shows("full traversal result"))
+fixture.liveReads[4].done({pr(8, "wrong account late PR")})
+assert(not fixture.state.read and not shows("wrong account late PR"))
+
+-- A warm PR cache remains instantly browseable, but triggers a live read
+-- rather than waiting for the cache's five-minute full traversal deadline.
+local warmPR = table.clone(prMirror)
+warmPR.checkedEpoch = os.time()
+start(warmPR, "pr")
+respond(1, a)
+assert(#fixture.scans == 0 and #fixture.liveReads == 1 and shows("old PR"))
+fixture.liveReads[1].done({pr(2, "warm cache updated"), pr(1, "warm CI checked")})
+assert(shows("warm cache updated") and not shows("old PR"))
+
+start()
+respond(1, a)
+fixture.scans[1].progress("prs", {pr(1, "partially scanned PR")})
+fixture.scans[1].done(nil, "historical scan failed")
+assert(block.key(fixture.state, {name="tab"}, cx))
+assert(fixture.liveReads[1].snapshot == nil, "partial progress is not an authenticated complete baseline")
+fixture.liveReads[1].done({pr(1, "live row after scan failure")})
+assert(fixture.state.read and shows("live row after scan failure") and not shows("共 1 项"))
+print("PR polling, focus refresh, warm-cache freshness, cancellation, and backoff passed.")
 
 print("Issue draft identity, approved visibility, failed sync, and post-create refresh passed.")
 LUAU

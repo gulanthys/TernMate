@@ -15,6 +15,7 @@ local data = {}
 
 local repoArgs = "$owner:String!,$name:String!"
 local repository = "repository(owner:$owner,name:$name)"
+local identitySelection = "viewer{id login} " .. repository .. "{id nameWithOwner}"
 local identityFields = "id nameWithOwner url visibility hasIssuesEnabled isFork defaultBranchRef{name} parent{nameWithOwner url}"
 local paging = "pageInfo{hasNextPage endCursor}"
 local index = "id number updatedAt state"
@@ -328,6 +329,82 @@ local function sameProbe(kind: Kind, a: any, b: any): boolean
 	return true
 end
 
+local function pageError(kind: Kind, current: any, detail: boolean, covered: number, expected: number?,
+	seen: {[string]: boolean}, numbers: {[number]: boolean}, cursors: {[string]: boolean}): string?
+	if not connection(current) or (expected ~= nil and expected ~= current.totalCount) then
+		return "分页响应不完整或远端列表数量已变化。"
+	end
+	for position, item in current.nodes do
+		local valid = if detail then itemShape(kind, item, true) else indexShape(kind, item)
+		if type(position) ~= "number" or position < 1 or position > #current.nodes
+			or not valid or seen[item.id] or numbers[item.number] then
+			return "扫描期间列表变化或对象身份缺失；请重新扫描。"
+		end
+		seen[item.id], numbers[item.number] = true, true
+	end
+	local after, hasNext = current.pageInfo.endCursor, current.pageInfo.hasNextPage
+	covered += #current.nodes
+	if (hasNext and (#current.nodes == 0 or covered >= current.totalCount or type(after) ~= "string" or after == "" or cursors[after]))
+		or (not hasNext and covered ~= current.totalCount) then
+		return "列表游标不完整、重复或条目未读完；请重新扫描。"
+	end
+	return nil
+end
+
+local function expand(identity: Identity, request: (string, {[string]: any}, (any) -> ()) -> (),
+	fail: (string) -> (), alive: () -> boolean, kind: Kind, items: {any}, detail: boolean, ready: () -> ())
+	local jobs: {{item: any, spec: Nested, seen: {[string]: boolean}}} = {}
+	for _, item in items do
+		for _, spec in kind.nested do
+			local part = item[spec.name]
+			local seen: {[string]: boolean} = {}
+			if not connection(part) or not acceptChildren(spec, part.nodes, detail, seen) or (if part.pageInfo.hasNextPage
+				then #part.nodes == 0 or #part.nodes >= part.totalCount else #part.nodes ~= part.totalCount) then
+				fail("#" .. item.number .. " 的 " .. spec.name .. " 响应不完整。"); return
+			end
+			if part.pageInfo.hasNextPage then table.insert(jobs, {item = item, spec = spec, seen = seen}) end
+		end
+	end
+	local function nextJob(index: number)
+		if not alive() then return end
+		local job = jobs[index]
+		if not job then ready(); return end
+		local item, spec = job.item, job.spec
+		local part = item[spec.name]
+		local query = "query(" .. repoArgs .. ",$id:ID!,$cursor:String!){" .. identitySelection
+			.. " node(id:$id){... on " .. kind.typename .. "{id number updatedAt repository{id} "
+			.. (if kind == pr then "headRefOid " else "") .. nestedFields(spec, detail, true) .. "}}}"
+		local visited: {[string]: boolean} = {}
+		local function more()
+			local cursor = part.pageInfo.endCursor
+			if type(cursor) ~= "string" or cursor == "" or visited[cursor] then
+				fail("#" .. item.number .. " 的 " .. spec.name .. " 游标缺失或重复。"); return
+			end
+			visited[cursor] = true
+			request(query, {id = item.id, cursor = cursor}, function(value)
+				local node = value.node
+				local page = if type(node) == "table" then node[spec.name] else nil
+				if type(node) ~= "table" or not sameVersion(node, item) or type(node.repository) ~= "table"
+					or node.repository.id ~= identity.repoId or not connection(page) or page.totalCount ~= part.totalCount
+					or #page.nodes == 0 or not acceptChildren(spec, page.nodes, detail, job.seen) then
+					fail("#" .. item.number .. " 的 " .. spec.name .. " 已变化或未读完。"); return
+				end
+				for _, child in page.nodes do table.insert(part.nodes, child) end
+				part.pageInfo = page.pageInfo
+				if part.pageInfo.hasNextPage and #part.nodes < part.totalCount then
+					tern.timer(0, more)
+				elseif not part.pageInfo.hasNextPage and #part.nodes == part.totalCount then
+					nextJob(index + 1)
+				else
+					fail("#" .. item.number .. " 的 " .. spec.name .. " 分页数量变化。")
+				end
+			end)
+		end
+		more()
+	end
+	nextJob(1)
+end
+
 local function syncScope(repo: Repo, identity: Identity, scope: string, revision: string, previous: any,
 	isAlive: () -> boolean, done: SyncCallback, progress: Progress?, lastVisible: any?)
 	local oldIssues: {[string]: any}? = nil
@@ -349,7 +426,6 @@ local function syncScope(repo: Repo, identity: Identity, scope: string, revision
 		and previous.repoUrl == identity.webUrl and previous.viewer == identity.viewer
 	local remaining = 2
 	local stopped = false
-	local identitySelection = "viewer{id login} " .. repository .. "{id nameWithOwner}"
 	local function alive(): boolean return not stopped and isAlive() end
 	local function fail(err: string?, scopeChanged: boolean?, revisionChanged: boolean?)
 		if not alive() then return end
@@ -431,58 +507,6 @@ local function syncScope(repo: Repo, identity: Identity, scope: string, revision
 			settle(snapshot, nil)
 		end, revision)
 	end
-	local function expand(kind: Kind, items: {any}, detail: boolean, ready: () -> ())
-		local jobs: {{item: any, spec: Nested, seen: {[string]: boolean}}} = {}
-		for _, item in items do
-			for _, spec in kind.nested do
-				local part = item[spec.name]
-				local seen: {[string]: boolean} = {}
-				if not connection(part) or not acceptChildren(spec, part.nodes, detail, seen) or (if part.pageInfo.hasNextPage
-					then #part.nodes == 0 or #part.nodes >= part.totalCount else #part.nodes ~= part.totalCount) then
-					fail("#" .. item.number .. " 的 " .. spec.name .. " 响应不完整。"); return
-				end
-				if part.pageInfo.hasNextPage then table.insert(jobs, {item = item, spec = spec, seen = seen}) end
-			end
-		end
-		local function nextJob(index: number)
-			if not alive() then return end
-			local job = jobs[index]
-			if not job then ready(); return end
-			local item, spec = job.item, job.spec
-			local part = item[spec.name]
-			local query = "query(" .. repoArgs .. ",$id:ID!,$cursor:String!){" .. identitySelection
-				.. " node(id:$id){... on " .. kind.typename .. "{id number updatedAt repository{id} "
-				.. (if kind == pr then "headRefOid " else "") .. nestedFields(spec, detail, true) .. "}}}"
-			local visited: {[string]: boolean} = {}
-			local function more()
-				local cursor = part.pageInfo.endCursor
-				if type(cursor) ~= "string" or cursor == "" or visited[cursor] then
-					fail("#" .. item.number .. " 的 " .. spec.name .. " 游标缺失或重复。"); return
-				end
-				visited[cursor] = true
-				request(query, {id = item.id, cursor = cursor}, function(value)
-					local node = value.node
-					local page = if type(node) == "table" then node[spec.name] else nil
-					if type(node) ~= "table" or not sameVersion(node, item) or type(node.repository) ~= "table"
-						or node.repository.id ~= identity.repoId or not connection(page) or page.totalCount ~= part.totalCount
-						or #page.nodes == 0 or not acceptChildren(spec, page.nodes, detail, job.seen) then
-						fail("#" .. item.number .. " 的 " .. spec.name .. " 已变化或未读完。"); return
-					end
-					for _, child in page.nodes do table.insert(part.nodes, child) end
-					part.pageInfo = page.pageInfo
-					if part.pageInfo.hasNextPage and #part.nodes < part.totalCount then
-						tern.timer(0, more)
-					elseif not part.pageInfo.hasNextPage and #part.nodes == part.totalCount then
-						nextJob(index + 1)
-					else
-						fail("#" .. item.number .. " 的 " .. spec.name .. " 分页数量变化。")
-					end
-				end)
-			end
-			more()
-		end
-		nextJob(1)
-	end
 	local function scan(kind: Kind, destination: {any}, old: {[string]: any}?)
 		local cursors: {[string]: boolean} = {}
 		local seen: {[string]: boolean} = {}
@@ -530,7 +554,7 @@ local function syncScope(repo: Repo, identity: Identity, scope: string, revision
 		local openProbeQuery = if warm then nodeQuery(fields(kind, false)) else ""
 		local function resolve(inventory: {any}, detail: boolean, complete: ({any}) -> ())
 			if detail then
-				expand(kind, inventory, true, function()
+				expand(identity, request, fail, alive, kind, inventory, true, function()
 					publish(inventory)
 					if alive() then complete(inventory) end
 				end)
@@ -565,7 +589,7 @@ local function syncScope(repo: Repo, identity: Identity, scope: string, revision
 							end
 							item.repository = nil
 						end
-						expand(kind, value.nodes, detail, function()
+						expand(identity, request, fail, alive, kind, value.nodes, detail, function()
 							for offset = 1, #ids do use(positions[first + offset - 1], value.nodes[offset]) end
 							if detail then publish(value.nodes) end
 							if not alive() then return end
@@ -621,26 +645,11 @@ local function syncScope(repo: Repo, identity: Identity, scope: string, revision
 			local detail = cursor == nil or not warm
 			request(if cursor == nil then firstQuery else nextQuery, {cursor = cursor}, function(value)
 				local current = value.repository[kind.name]
-				if not connection(current) or (count ~= nil and count ~= current.totalCount) then
-					fail("分页响应不完整或远端列表数量已变化。"); return
-				end
-				local expected: number = current.totalCount
-				count = expected
-				for position, item in current.nodes do
-					local valid = if detail then itemShape(kind, item, true) else indexShape(kind, item)
-					if type(position) ~= "number" or position < 1 or position > #current.nodes
-						or not valid or seen[item.id] or numbers[item.number] then
-						fail("扫描期间列表变化或对象身份缺失；请重新扫描。"); return
-					end
-					seen[item.id], numbers[item.number] = true, true
-				end
+				local err = pageError(kind, current, detail, #destination, count, seen, numbers, cursors)
+				if err then fail(err); return end
+				count = current.totalCount
 				local after = current.pageInfo.endCursor
 				local hasNext = current.pageInfo.hasNextPage
-				local covered = #destination + #current.nodes
-				if (hasNext and (#current.nodes == 0 or covered >= expected or type(after) ~= "string" or after == "" or cursors[after]))
-					or (not hasNext and covered ~= expected) then
-					fail("列表游标不完整、重复或条目未读完；请重新扫描。"); return
-				end
 				resolve(current.nodes, detail, function(items)
 					for _, item in items do table.insert(destination, item) end
 					if not hasNext then confirmMissing(); return end
@@ -653,6 +662,111 @@ local function syncScope(repo: Repo, identity: Identity, scope: string, revision
 	end
 	scan(issue, snapshot.issues, oldIssues)
 	scan(pr, snapshot.prs, oldPrs)
+end
+
+-- Refresh volatile PR evidence independently of the historical mirror sweep.
+-- Every returned row is freshly hydrated; no cache writes or freshness stamps.
+function data.refreshPRs(repo: Repo, identity: Identity, previous: any, isAlive: () -> boolean,
+	done: (any, string?, boolean?) -> ())
+	if not isAlive() then return end
+	if not identityScope(repo, identity) or type(identity.viewer) ~= "string" or identity.viewer == "" then
+		done(nil, "无法核对仓库与登录账号。", true); return
+	end
+	local old: {[string]: any}? = nil
+	if previous ~= nil then
+		if not sameScope(repo, identity, previous) then done(nil, "PR 基线身份不符。", true); return end
+		old = indexItems(pr, previous.prs)
+		if not old then done(nil, "PR 基线不完整。"); return end
+	end
+	local stopped = false
+	local rows: {any} = {}
+	local seen: {[string]: boolean} = {}
+	local numbers: {[number]: boolean} = {}
+	local cursors: {[string]: boolean} = {}
+	local count: number? = nil
+	local function alive(): boolean return not stopped and isAlive() end
+	local function fail(err: string, identityChanged: boolean?)
+		if not alive() then return end
+		stopped = true
+		done(nil, err, identityChanged)
+	end
+	local function request(query: string, vars: {[string]: any}, received: (any) -> ())
+		if not alive() then return end
+		graphql(repo, query, vars, function(value, err, identityChanged)
+			if not alive() then return end
+			if not value then fail(err or "PR 刷新中断。", identityChanged); return end
+			local r, user = value.repository, value.viewer
+			if not checkedRepo(repo, r) or r.id ~= identity.repoId or type(user) ~= "table"
+				or user.id ~= identity.viewerId or user.login ~= identity.viewer then
+				fail("刷新期间仓库或账号身份无法核对；请刷新。", true); return
+			end
+			received(value)
+		end)
+	end
+	local selection = fields(pr, true)
+	local lookup = "query(" .. repoArgs .. ",$ids:[ID!]!){" .. identitySelection
+		.. " nodes(ids:$ids){... on PullRequest{repository{id nameWithOwner} " .. selection .. "}}}"
+	local function finish()
+		if not alive() then return end
+		stopped = true
+		done(rows, nil)
+	end
+	local function transitioned()
+		local missing: {string} = {}
+		if old then
+			for id, item in old do
+				if item.state == "OPEN" and not seen[id] then table.insert(missing, id) end
+			end
+		end
+		local function batch(first: number)
+			if not alive() then return end
+			if first > #missing then finish(); return end
+			local ids: {string} = {}
+			for i = first, math.min(first + 29, #missing) do table.insert(ids, missing[i]) end
+			request(lookup, {ids = ids}, function(value)
+				if type(value.nodes) ~= "table" or #value.nodes ~= #ids then fail("缺失 PR 的响应不完整。"); return end
+				for position, id in ids do
+					local item = value.nodes[position]
+					local prior = old and old[id]
+					if not itemShape(pr, item, true) or item.id ~= id or not prior or item.number ~= prior.number
+						or (item.state ~= "CLOSED" and item.state ~= "MERGED") or numbers[item.number]
+						or not checkedRepo(repo, item.repository) or item.repository.id ~= identity.repoId then
+						fail("PR 列表遗漏了开放对象，或对象已移动、删除；请重新刷新。"); return
+					end
+					numbers[item.number] = true
+					item.repository = nil
+				end
+				expand(identity, request, fail, alive, pr, value.nodes, true, function()
+					for _, item in value.nodes do table.insert(rows, item) end
+					if alive() then tern.timer(0, function() batch(first + #ids) end) end
+				end)
+			end)
+		end
+		batch(1)
+	end
+	local query = "query(" .. repoArgs .. ",$cursor:String){viewer{id login} " .. repository
+		.. "{id nameWithOwner pullRequests(first:30,after:$cursor,states:[OPEN],orderBy:{field:CREATED_AT,direction:DESC})"
+		.. "{totalCount " .. paging .. " nodes{" .. selection .. "}}}}"
+	local function page(cursor: string?)
+		request(query, {cursor = cursor}, function(value)
+			local current = value.repository.pullRequests
+			local err = pageError(pr, current, true, #rows, count, seen, numbers, cursors)
+			if err then fail(err); return end
+			count = current.totalCount
+			for _, item in current.nodes do
+				if item.state ~= "OPEN" then fail("开放 PR 列表在刷新期间发生变化。"); return end
+			end
+			local after, hasNext = current.pageInfo.endCursor, current.pageInfo.hasNextPage
+			expand(identity, request, fail, alive, pr, current.nodes, true, function()
+				for _, item in current.nodes do table.insert(rows, item) end
+				if not alive() then return end
+				if not hasNext then transitioned(); return end
+				cursors[after] = true
+				tern.timer(0, function() page(after) end)
+			end)
+		end)
+	end
+	page(nil)
 end
 
 function data.resultRevision(repo: Repo, identity: Identity, done: (string?, string?) -> ())
