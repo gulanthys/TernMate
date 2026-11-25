@@ -42,7 +42,7 @@ base=$(git -C "$checkout" rev-parse HEAD)
 blob=$(git -C "$checkout" rev-parse HEAD:tracked)
 git -C "$checkout" tag -a -m fixture baseline-tag "$base"
 tag=$(git -C "$checkout" rev-parse refs/tags/baseline-tag)
-helper prepare-issue "$task" "$checkout" 7 "$base"
+git -C "$checkout" worktree add -q --no-track -b "$branch" -- "$wt" "$base"
 
 printf 'aggregate commit\n' > "$wt/aggregate"
 git -C "$wt" add aggregate

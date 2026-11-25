@@ -1632,19 +1632,26 @@ local function openVerified(exec: runtime.Exec, request: Request, progress: (str
 										if persist() then useRecord(version, record) end
 									end
 									if not alive() then finish(nil, '来源面板已关闭。'); return end
+									local url = 'https://' .. repo.host .. '/' .. repo.owner .. '/' .. repo.name .. '.git'
 									if request.kind == ISSUE then
-										progress('正在从本地 HEAD 创建 Issue 分支和独立 worktree…')
-										helper(exec, { 'prepare-issue', dir, checkout, paneId(request.number), head }, { timeout_ms = 180000 }, function(git, gitError)
-											if git and git.status == 0 then prepared(); return end
+										progress('正在拉取远端 main 并创建 Issue 工作区…')
+										helper(exec, { 'prepare-issue', dir, checkout, paneId(request.number), url }, { timeout_ms = 180000 }, function(git, gitError)
+											if git and git.status == 0 and not git.timed_out then
+												local base = runtime.trim(git.stdout)
+												if oid(base) or (#base == 64 and base:match('^[0-9a-f]+$')) then
+													index.records[base] = record
+													if persist() then useRecord(base, record) end
+													return
+												end
+											end
 											local status = git and git.status
-											finish(nil, if status == 3 then '所选 checkout 没有可用的 HEAD 提交；无法创建 Issue worktree。'
-												elseif status == 4 then '仓库配置了本地 Git checkout filter；为避免在只读打开时执行它，未创建 Issue worktree。'
+											finish(nil, if status == 3 then '无法拉取所选仓库的远端 main；检查分支、权限和网络。'
+												elseif status == 4 then '仓库配置了本地 Git checkout filter；未创建 Issue worktree。'
 												else '不能创建 Issue 分支或 worktree。' .. runtime.failure(git, gitError))
 										end)
 										return
 									end
 									progress('正在验证 PR 引用并创建独立 worktree…')
-									local url = 'https://' .. repo.host .. '/' .. repo.owner .. '/' .. repo.name .. '.git'
 									local args = { 'prepare', dir, url, 'refs/pull/' .. paneId(request.number) .. '/head', head, paneId(request.number) }
 									if revision and revision.baseSHA and revision.baseRef then
 										table.insert(args, revision.baseSHA)
@@ -1675,17 +1682,8 @@ local function openVerified(exec: runtime.Exec, request: Request, progress: (str
 					end
 				end
 				if request.kind == ISSUE then
-					helper(exec, { 'issue-head', checkout }, nil, function(result)
-						local head = if result and result.status == 0 then runtime.trim(result.stdout) else ''
-						if not oid(head) and not (#head == 64 and head:match('^[0-9a-f]+$')) then
-							finish(nil, '无法读取所选 checkout 的 HEAD。'); return
-						end
-						local latest = index.latest
-						if latest and latest ~= head then
-							updateNote = ' 来源 HEAD 已更新：' .. latest:sub(1, 12) .. ' → ' .. head:sub(1, 12) .. '。旧工作区已保留。'
-						end
-						choose(head, nil)
-					end)
+					local latest = index.latest
+					if latest then choose(latest, nil) else prepare('', '', nil) end
 					return
 				end
 				local selected = request.version

@@ -223,8 +223,10 @@ local function exec(argv, opts, cb)
 				assert(s.baseline and s.markdown)
 			end
 			cb(result(0))
-		elseif op == 'issue-head' then cb(result(0, head .. '\n'))
-		elseif op == 'check-issue' or op == 'prepare-issue' then cb(result(0))
+		elseif op == 'prepare-issue' then
+			assert(argv[7] == 'https://' .. repo.host .. '/' .. repo.owner .. '/' .. repo.name .. '.git')
+			cb(result(0, head .. '\n'))
+		elseif op == 'check-issue' then cb(result(0))
 		elseif op == 'prepare' or op == 'pr-prompt' then cb(result(0))
 		elseif op == 'check-review' then cb(if s.cleaned then result(6) else result(0, head .. '\nclean\n'))
 		elseif op == 'cleanup-pr-check' or op == 'cleanup-pr' then

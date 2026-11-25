@@ -12,6 +12,8 @@ private_dir() { [ -d "$1" ] && [ ! -L "$1" ]; }
 regular() { [ -f "$1" ] && [ ! -L "$1" ]; }
 
 safe_git() (
+    protocol=https
+    if [ "$1" = --local-transfer ]; then protocol=file; shift; fi
     # No inherited repository locations, helpers/filters, redirects or Git tracing.
     # This does not clear gh's login environment or write its credentials anywhere.
     unset GIT_DIR GIT_WORK_TREE GIT_COMMON_DIR GIT_INDEX_FILE GIT_OBJECT_DIRECTORY \
@@ -21,7 +23,7 @@ safe_git() (
         GIT_TRACE GIT_TRACE_PACKET GIT_TRACE_PACK_ACCESS GIT_TRACE_CURL GIT_CURL_VERBOSE \
         GIT_TRACE_PERFORMANCE GIT_TRACE_SETUP GIT_TRACE2 GIT_TRACE2_EVENT GIT_TRACE2_PERF
     export GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=/dev/null GIT_ATTR_NOSYSTEM=1 \
-        GIT_ALLOW_PROTOCOL=https GIT_TERMINAL_PROMPT=0 GIT_ASKPASS=/usr/bin/false \
+        GIT_ALLOW_PROTOCOL="$protocol" GIT_TERMINAL_PROMPT=0 GIT_ASKPASS=/usr/bin/false \
         GIT_NO_REPLACE_OBJECTS=1 GIT_NO_LAZY_FETCH=1
     export GH_PROMPT_DISABLED=1 GH_DEBUG= GIT_TRACE_REDACT=1
     exec git --no-optional-locks -c core.hooksPath=/dev/null -c core.fsmonitor=false \
@@ -394,13 +396,8 @@ case "$1" in
         } > "$temp"
         mv -f -- "$temp" "$dest"
         ;;
-    issue-head)
-        safe_git -C "$2" rev-parse --verify 'HEAD^{commit}'
-        ;;
     prepare-issue)
-        task=$2 checkout=$3 number=$4
-        head=$5
-        safe_git -C "$checkout" rev-parse --verify "$head^{commit}" >/dev/null || exit 3
+        task=$2 checkout=$3 number=$4 url=$5
         # A linked worktree inherits repository config. Do not run a
         # repo-local checkout filter on a read-only Issue activation.
         if safe_git -C "$checkout" config --get-regexp '^filter\..*\.(process|smudge)$' . >/dev/null; then
@@ -408,8 +405,25 @@ case "$1" in
         else
             [ "$?" -eq 1 ] || fail '无法核对 checkout 的 Git filter 配置。'
         fi
+        # Fetch in a clean repository so checkout-local URL rewrites and
+        # credential helpers cannot affect the network request.
+        scratch=$(mktemp -d "$task/.issue-fetch.XXXXXXXX")
+        trap 'rm -rf -- "$scratch"' EXIT
+        trap 'exit 1' HUP INT TERM
+        format=$(safe_git -C "$checkout" rev-parse --show-object-format)
+        safe_git init -q --bare --template= --object-format="$format" "$scratch"
+        if ! safe_git --git-dir="$scratch" -c http.followRedirects=false -c credential.helper= \
+            -c 'credential.helper=!gh auth git-credential' -c fetch.fsckObjects=true \
+            fetch -q --no-tags --no-recurse-submodules -- "$url" refs/heads/main:refs/heads/main; then
+            exit 3
+        fi
+        head=$(safe_git --git-dir="$scratch" rev-parse --verify 'refs/heads/main^{commit}')
+        safe_git --local-transfer -C "$checkout" fetch -q --no-tags --no-recurse-submodules \
+            --no-write-fetch-head --refmap= -- "$scratch" refs/heads/main
+        safe_git -C "$checkout" rev-parse --verify "$head^{commit}" >/dev/null
         safe_git -C "$checkout" -c submodule.recurse=false worktree add --no-track \
             -b "ternmate/issue-$number-${task##*.}" -- "$task/worktree" "$head" >&2
+        printf '%s\n' "$head"
         ;;
     check-issue)
         if absent "$2/worktree" && regular "$2/worktree-cleaned"; then exit 6; fi

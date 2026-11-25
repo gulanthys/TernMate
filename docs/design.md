@@ -67,10 +67,9 @@ tern plugin list
 
 ## Issue 工作区
 
-- 首次打开从所选 checkout 的已提交 `HEAD` 创建 linked worktree，以 `ternmate/issue-<编号>-<标识>` 为本地分支。多个 Issue 不共用工作目录、索引或分支，不复制源 checkout 的未提交文件，也不切换源分支。创建时关闭 Git hook 和子模块递归；发现仓库本地配置有 checkout filter 命令时拒绝准备工作区。
+- 首次打开从所选 GitHub 仓库拉取 `refs/heads/main`，以拉取到的提交创建 linked worktree 和 `ternmate/issue-<编号>-<标识>` 本地分支。网络拉取使用临时 Git 库，导入不更新源 checkout 的 `FETCH_HEAD` 或远端跟踪分支；拉取失败不回退到本地提交。创建时关闭 Git hook 和子模块递归，发现本地 checkout filter 命令则拒绝创建。
 - 列表区分已打开的本机会话、对话记录与待启动工作区。选中时在宿主后台检查该账号、checkout 和 Issue 对应的任务 worktree，验证所有权后读取相对初始提交的 HEAD 与工作区状态；配置含可执行清洗过滤器时不运行状态检查。没有写入 Git 索引，也不据此推断验收或远端推送状态。
-- 点击仍只授权分析；用户明确要求修复后，编辑限定在该 Issue 的 worktree。再次打开按所选 checkout 的 HEAD 选择版本；变化时自动打开那个提交对应的独立 worktree 并提示，既有工作区不重置。
-- 新版本打开后保留所有旧面板、会话、工作区和材料；若之后回到曾用的提交，可在核对工作区与会话后继续该版本。未绑定稳定身份或使用共享 checkout 的旧 Issue 会话不改写路径或历史，也不由工作台恢复。
+- 点击仍只授权分析；用户明确要求修复后，编辑限定在该 Issue 的 worktree。再次打开沿用已绑定的会话和工作区，不随 `main` 前移重建。未绑定稳定身份或使用共享 checkout 的旧 Issue 会话不改写路径或历史，也不由工作台恢复。
 
 ## PR 工作区与安全边界
 
